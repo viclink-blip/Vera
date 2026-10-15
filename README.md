@@ -23,30 +23,37 @@ pip install -r requirements.txt
 
 Needs Python 3.9 or newer.
 
-## 2. Get your Deriv API token
+## 2. Get your Deriv token and App ID
 
-1. Log in at **https://app.deriv.com**.
-2. Choose the account the bot should trade from the account switcher (top right):
-   - **Demo** account (`VRTC…`) – virtual money, use this first.
-   - **Real** account (`CR…`) – real money.
-3. Open **Account Settings → Security and safety → API token**
-   (direct link: https://app.deriv.com/account/api-token).
-4. Name the token (e.g. `mybot`) and tick the scopes **Read** and **Trade**.
-5. Click **Create**, then copy the token.
+Deriv's current API uses a **personal access token** (starts with `pat_`) together with the **App ID** of an app you register. The old `ws.binaryws.com` / `app_id=1089` connection is shut down and returns HTTP 520.
 
-A token belongs to the account that was active when you created it. To switch between demo and real, create a token on each account and change `DERIV_TOKEN`. The bot prints which account it is using at startup: `Authorized VRTC1234567 (DEMO)`.
+1. Log in at **https://developers.deriv.com** with your Deriv account.
+2. In the dashboard, **register a new application** and choose the PAT (personal access token) type. Copy its **App ID**.
+3. Under that app, **create a personal access token** with the **trade** scope (plus account/read if offered). Copy it straight away, because Deriv shows it only once.
+
+One token can trade both your demo and your real account. Choose which one with `ACCOUNT_TYPE` at the top of `vera_bot.py` (`"demo"` by default). At startup the bot prints the account it's using, e.g. `Logged in DOT1234567 (DEMO)`.
+
+Keep the token secret. Don't paste it into chats or screenshots, and don't `cat .env` where others can see it. If it leaks, delete it in the dashboard and create a new one.
 
 ## 3. Configure
 
 ```bash
 cp .env.example .env
-nano .env          # paste: DERIV_TOKEN=xxxxxxxxxxxx
+nano .env
+```
+
+`.env` must contain exactly these two lines (no spaces, no quotes):
+
+```
+DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
+DERIV_APP_ID=12345
 ```
 
 Settings are at the top of `vera_bot.py`:
 
 | Setting | Default | Meaning |
 |---|---|---|
+| `ACCOUNT_TYPE` | `"demo"` | `"demo"` or `"real"`: which of your Deriv accounts to use |
 | `SYMBOL` | `"R_75"` | Any Deriv symbol: `BOOM1000`, `CRASH500`, `frxEURUSD`, `frxXAUUSD`… |
 | `SHOW_ACTIVE_SYMBOLS` | `True` | Print all active symbols at startup |
 | `CONTRACT_MODE` | `"auto"` | `"auto"`, `"risefall"` or `"multiplier"` |
@@ -93,7 +100,7 @@ tail -f bot.log
 
 ## How it works
 
-1. Connects to `wss://ws.binaryws.com/websockets/v3?app_id=1089` and authorizes with `DERIV_TOKEN`.
+1. Sends `DERIV_TOKEN` and `DERIV_APP_ID` to `https://api.derivws.com`, picks your demo or real account, and gets a one-time, already-logged-in WebSocket URL. A fresh URL is requested on every reconnect.
 2. Calls `active_symbols`, prints them grouped by market, and checks that `SYMBOL` exists and whether its market is open.
 3. Calls `contracts_for` to pick the contract: Rise/Fall when it is offered (checking the duration), otherwise Multipliers (checking the multiplier).
 4. Subscribes to 1-minute candles with `ticks_history` (`style: candles`, `subscribe: 1`). This loads the last 100 candles and then streams every tick.
@@ -117,5 +124,5 @@ Other behaviour:
 - **Multipliers:** the most you can lose is the stake, and Deriv charges a commission. Boom/Crash have sudden spikes, so a position can be stopped out within seconds. In dry run, Multiplier P/L is estimated as `stake × multiplier × price change % − commission`. This is close to Deriv's figure but not exact.
 - If you upgraded from the earlier version, an existing `deriv_trades.csv` is renamed to `vera_trades.csv` and gets the new `rsi` column added automatically.
 - Forex (`frx…`) only trades on weekdays, and Deriv does not offer tick-duration Rise/Fall on it. With `AUTO_ADJUST_DURATION` the bot picks the shortest allowed duration and prints it.
-- `app_id=1089` is Deriv's public test app id. For heavy use, register your own at https://api.deriv.com and change `APP_ID`.
+- Old-style tokens (not starting with `pat_`) still use the legacy `ws.derivws.com` connection. Deriv has shut that down, so create a `pat_` token instead.
 - Never commit your `.env`. It is already in `.gitignore`.

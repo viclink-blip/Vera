@@ -8,8 +8,10 @@ Strategy : MA7 / MA14 crossover on 1-minute candles, filtered by RSI(14).
 Symbols  : any Deriv symbol (R_75, 1HZ100V, BOOM1000, CRASH500, frxEURUSD,
            frxXAUUSD, ...). Uses Rise/Fall where the symbol offers it, else
            Multipliers (e.g. Boom/Crash).
-API      : wss://ws.binaryws.com/websockets/v3?app_id=1089
-Auth     : DERIV_TOKEN in .env (demo or real token - the token decides the account)
+API      : https://api.derivws.com (REST login) -> one-time authenticated WebSocket
+Auth     : DERIV_TOKEN (pat_... personal access token) + DERIV_APP_ID in .env.
+           The bot gets a one-time WebSocket URL from https://api.derivws.com
+           for the account chosen with ACCOUNT_TYPE (demo / real).
 
 Run      : python3 vera_bot.py              (uses SYMBOL below)
            python3 vera_bot.py BOOM1000     (override the symbol)
@@ -23,11 +25,14 @@ import os
 import signal
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import websockets
+import websockets.exceptions
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"))
@@ -35,6 +40,8 @@ load_dotenv(Path(__file__).with_name(".env"))
 # ============================================================================
 #  SETTINGS - edit these
 # ============================================================================
+ACCOUNT_TYPE = "demo"        # "demo" or "real" - which of your Deriv accounts to use
+
 SYMBOL = "R_75"              # any Deriv symbol, e.g. R_75, R_100, 1HZ100V, BOOM1000,
                              # CRASH500, JD25, frxEURUSD, frxXAUUSD, cryBTCUSD ...
                              # run `python3 vera_bot.py --symbols` to see them all
@@ -75,8 +82,10 @@ DAILY_TAKE_PROFIT = 0        # stop when today's P/L reaches +X USD (0 = disable
 DRY_RUN = True               # True = simulate trades on live prices, no real buys
 DRY_RUN_START_BALANCE = 1000.0  # simulated balance when no token is set
 
-APP_ID = 1089
-API_URL = os.getenv("DERIV_API_URL") or f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
+APP_ID = os.getenv("DERIV_APP_ID", "").strip()   # your app ID from developers.deriv.com
+REST_URL = os.getenv("DERIV_REST_URL") or "https://api.derivws.com"
+LEGACY_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"   # old-style tokens only
+API_URL = os.getenv("DERIV_API_URL")   # optional override of the WebSocket URL (testing)
 CSV_FILE = Path(__file__).with_name("vera_trades.csv")
 # ============================================================================
 
@@ -194,6 +203,78 @@ def parse_duration(text):
     return int(text[:-1]), text[-1]
 
 
+def rest_call(method, path, token):
+    """Call Deriv's REST API with a PAT token. Returns the parsed JSON."""
+    req = urllib.request.Request(REST_URL + path, method=method, data=b"" if method == "POST" else None)
+    req.add_header("Authorization", f"Bearer {token}")
+    req.add_header("Deriv-App-ID", APP_ID)
+    req.add_header("Accept", "application/json")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")[:300]
+        if e.code in (401, 403):
+            raise SystemExit(f"Deriv rejected the token or App ID (HTTP {e.code}): {body}\n"
+                             "Check DERIV_TOKEN and DERIV_APP_ID in .env - the token must "
+                             "belong to that app and have the trade scope.")
+        raise ConnectionError(f"{method} {path} failed: HTTP {e.code} {body}")
+
+
+def is_demo(account):
+    kind = str(account.get("account_type") or account.get("type") or "").lower()
+    return kind in ("demo", "virtual") or bool(account.get("is_virtual"))
+
+
+def check_env():
+    """Catch the common .env mistakes before connecting."""
+    env = Path(__file__).with_name(".env")
+    if not os.getenv("DERIV_TOKEN", "").strip():
+        lines = env.read_text().split() if env.exists() else []
+        if any(line.startswith("pat_") for line in lines):
+            raise SystemExit(".env has the token on its own - the line must read: DERIV_TOKEN=pat_...")
+        raise SystemExit(f"DERIV_TOKEN missing - put DERIV_TOKEN=... in {env}")
+
+
+def explain_http_520(e):
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status == 520:
+        raise SystemExit("Deriv's old API server rejected the connection (HTTP 520). "
+                         "Use a new pat_ token plus DERIV_APP_ID in .env (see README).")
+
+
+async def get_session(token):
+    """Return (websocket_url, account) for this run.
+    PAT tokens: list accounts, pick ACCOUNT_TYPE, get a one-time authenticated URL.
+    Old-style tokens: legacy URL, authorized with an `authorize` message (account=None)."""
+    if API_URL:
+        return API_URL, None
+    if not token:
+        raise SystemExit("DERIV_TOKEN missing in .env")
+    if not token.startswith("pat_"):
+        return LEGACY_WS_URL, None
+    if not APP_ID:
+        raise SystemExit("DERIV_APP_ID missing in .env - copy the App ID of the app you "
+                         "created the token under at developers.deriv.com")
+    data = (await asyncio.to_thread(rest_call, "GET", "/trading/v1/options/accounts", token)).get("data", [])
+    accounts = [data] if isinstance(data, dict) else list(data)
+    if not accounts:
+        raise SystemExit("No Options accounts found for this token")
+    want_demo = ACCOUNT_TYPE.lower() == "demo"
+    matches = [a for a in accounts if is_demo(a) == want_demo]
+    if not matches:
+        found = ", ".join(f"{a.get('account_id')} ({'demo' if is_demo(a) else 'real'})" for a in accounts)
+        raise SystemExit(f"No {ACCOUNT_TYPE} account for this token. Found: {found}")
+    account = matches[0]
+    otp = await asyncio.to_thread(
+        rest_call, "POST", f"/trading/v1/options/accounts/{account['account_id']}/otp", token)
+    url = (otp.get("data") or {}).get("url")
+    if not url:
+        raise ConnectionError(f"OTP response had no WebSocket URL: {str(otp)[:200]}")
+    return url, account
+
+
 class TradingBot:
     def __init__(self, token):
         self.token = token
@@ -207,6 +288,7 @@ class TradingBot:
         self.kind = "risefall"                  # or "multiplier" - set by resolve_contract()
         self.multiplier = MULTIPLIER
         self.symbols_shown = False
+        self.symbol_key = "underlying_symbol"   # new API name; falls back to "symbol"
 
         self.closes = pd.Series(dtype=float)   # closed candles, index = open_time
         self.current_open_time = None
@@ -259,12 +341,24 @@ class TradingBot:
             log(f"Could not read {CSV_FILE.name} ({e}); daily P/L starts at 0")
             return 0.0
 
-    async def authorize(self):
-        if not self.token:
+    async def authorize(self, account):
+        if account is not None:   # PAT flow: the socket is already logged in
+            self.account = account["account_id"]
+            self.is_virtual = is_demo(account)
+            self.currency = account.get("currency") or CURRENCY
+            try:
+                bal = (await self.api.request({"balance": 1}))["balance"]
+                balance = float(bal["balance"])
+                self.currency = bal.get("currency") or self.currency
+            except (DerivAPIError, KeyError, TypeError, ValueError):
+                balance = float(account.get("balance") or 0)
             if not DRY_RUN:
-                raise SystemExit("DERIV_TOKEN missing in .env - required when DRY_RUN = False")
-            log("No DERIV_TOKEN - running dry run without an account")
+                self.balance = balance
+            kind = "DEMO" if self.is_virtual else "REAL"
+            log(f"Logged in {self.account} ({kind}) balance {balance:.2f} {self.currency}")
             return
+        if not self.token:
+            raise SystemExit("DERIV_TOKEN missing in .env")
         auth = (await self.api.request({"authorize": self.token}))["authorize"]
         self.account = auth["loginid"]
         self.is_virtual = bool(auth.get("is_virtual"))
@@ -457,7 +551,7 @@ class TradingBot:
     def proposal_request(self, direction, stake):
         """Build the proposal for the contract kind SYMBOL supports."""
         req = {"proposal": 1, "amount": stake, "basis": "stake",
-               "currency": self.currency, "symbol": SYMBOL}
+               "currency": self.currency, self.symbol_key: SYMBOL}
         if self.kind == "multiplier":
             req["contract_type"] = "MULTUP" if direction == "RISE" else "MULTDOWN"
             req["multiplier"] = self.multiplier
@@ -487,7 +581,16 @@ class TradingBot:
         req = self.proposal_request(direction, stake)
         contract_type = req["contract_type"]
         try:
-            proposal = (await self.api.request(req))["proposal"]
+            try:
+                proposal = (await self.api.request(req))["proposal"]
+            except DerivAPIError as e:
+                if e.code != "InputValidationFailed":
+                    raise
+                # API version uses the other field name for the symbol - switch and retry
+                other = "symbol" if self.symbol_key == "underlying_symbol" else "underlying_symbol"
+                req[other] = req.pop(self.symbol_key)
+                proposal = (await self.api.request(req))["proposal"]
+                self.symbol_key = other
         except DerivAPIError as e:
             log(f"Proposal rejected: {e}")
             return
@@ -698,11 +801,12 @@ class TradingBot:
                 self.on_tick(epoch, close)
 
     async def run_session(self):
-        self.api = DerivAPI(API_URL)
+        url, account = await get_session(self.token)
+        self.api = DerivAPI(url)
         await self.api.connect()
-        log(f"Connected to {API_URL}")
+        log(f"Connected to {url.split('?')[0]}")
         try:
-            await self.authorize()
+            await self.authorize(account)
             await self.load_active_symbols(show=SHOW_ACTIVE_SYMBOLS and not self.symbols_shown)
             self.symbols_shown = True
             await self.resolve_contract()
@@ -742,6 +846,7 @@ class TradingBot:
                 log(f"API error: {e}")
             except (ConnectionError, OSError, asyncio.TimeoutError,
                     websockets.exceptions.WebSocketException) as e:
+                explain_http_520(e)
                 log(f"Connection problem: {e!r}")
             if self.stopped:
                 break
@@ -773,9 +878,12 @@ def print_symbols(symbols):
 
 
 async def list_symbols():
-    api = DerivAPI(API_URL)
+    url, account = await get_session(os.getenv("DERIV_TOKEN", "").strip())
+    api = DerivAPI(url)
     await api.connect()
     try:
+        if account is None and os.getenv("DERIV_TOKEN", "").strip() and not API_URL:
+            await api.request({"authorize": os.getenv("DERIV_TOKEN").strip()})
         resp = await api.request({"active_symbols": "brief"})
         symbols = resp["active_symbols"]
         for sym in symbols:
@@ -788,8 +896,14 @@ async def list_symbols():
 async def main():
     global SYMBOL
     args = sys.argv[1:]
+    if not API_URL:
+        check_env()
     if "--symbols" in args:
-        await list_symbols()
+        try:
+            await list_symbols()
+        except websockets.exceptions.WebSocketException as e:
+            explain_http_520(e)
+            raise
         return
     if args:
         SYMBOL = args[0]
