@@ -1,5 +1,6 @@
 .env
-deriv_trades.csv
+vera_trades.csv
 __pycache__/
 .venv/
 venv/
+deriv_trades.csv

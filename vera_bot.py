@@ -11,9 +11,9 @@ Symbols  : any Deriv symbol (R_75, 1HZ100V, BOOM1000, CRASH500, frxEURUSD,
 API      : wss://ws.binaryws.com/websockets/v3?app_id=1089
 Auth     : DERIV_TOKEN in .env (demo or real token - the token decides the account)
 
-Run      : python3 deriv_bot.py              (uses SYMBOL below)
-           python3 deriv_bot.py BOOM1000     (override the symbol)
-           python3 deriv_bot.py --symbols    (list active symbols and exit)
+Run      : python3 vera_bot.py              (uses SYMBOL below)
+           python3 vera_bot.py BOOM1000     (override the symbol)
+           python3 vera_bot.py --symbols    (list active symbols and exit)
 """
 
 import asyncio
@@ -37,7 +37,7 @@ load_dotenv(Path(__file__).with_name(".env"))
 # ============================================================================
 SYMBOL = "R_75"              # any Deriv symbol, e.g. R_75, R_100, 1HZ100V, BOOM1000,
                              # CRASH500, JD25, frxEURUSD, frxXAUUSD, cryBTCUSD ...
-                             # run `python3 deriv_bot.py --symbols` to see them all
+                             # run `python3 vera_bot.py --symbols` to see them all
 SHOW_ACTIVE_SYMBOLS = True   # print every active Deriv symbol at startup
 
 CONTRACT_MODE = "auto"       # "auto": Rise/Fall when the symbol offers it, else Multipliers
@@ -77,7 +77,7 @@ DRY_RUN_START_BALANCE = 1000.0  # simulated balance when no token is set
 
 APP_ID = 1089
 API_URL = os.getenv("DERIV_API_URL") or f"wss://ws.binaryws.com/websockets/v3?app_id={APP_ID}"
-CSV_FILE = Path(__file__).with_name("deriv_trades.csv")
+CSV_FILE = Path(__file__).with_name("vera_trades.csv")
 # ============================================================================
 
 CSV_COLUMNS = [
@@ -234,6 +234,9 @@ class TradingBot:
     @staticmethod
     def _migrate_csv():
         """Add new columns (e.g. rsi) to a CSV written by an older version."""
+        old_csv = CSV_FILE.with_name("deriv_trades.csv")   # name used by earlier versions
+        if old_csv.exists() and not CSV_FILE.exists():
+            old_csv.rename(CSV_FILE)
         if not CSV_FILE.exists():
             return
         with CSV_FILE.open() as f:

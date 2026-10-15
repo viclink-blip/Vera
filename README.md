@@ -6,7 +6,7 @@
 - **RSI(14) filter:** a Rise is skipped when RSI ≥ 70 (overbought) and a Fall is skipped when RSI ≤ 30 (oversold).
 - **Any symbol:** Volatility (`R_75`, `1HZ100V`), Boom/Crash (`BOOM1000`, `CRASH500`), Jump, forex (`frxEURUSD`), metals (`frxXAUUSD`), crypto and more. At startup the bot prints every active Deriv symbol and checks yours.
 - **Contract type is chosen automatically:** Rise/Fall when the symbol offers it, otherwise **Multipliers** (Up/Down). Boom/Crash only offer Multipliers.
-- **Safety:** dry run by default, a daily stop loss, optional martingale, and every trade logged to `deriv_trades.csv`.
+- **Safety:** dry run by default, a daily stop loss, optional martingale, and every trade logged to `vera_trades.csv`.
 
 > ⚠️ Trading binary/digital options carries a high risk of loss. Nothing here is a profitable strategy guarantee. Always test on a **demo** account first.
 
@@ -43,7 +43,7 @@ cp .env.example .env
 nano .env          # paste: DERIV_TOKEN=xxxxxxxxxxxx
 ```
 
-Settings are at the top of `deriv_bot.py`:
+Settings are at the top of `vera_bot.py`:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -69,9 +69,9 @@ Settings are at the top of `deriv_bot.py`:
 ## 4. Run
 
 ```bash
-python3 deriv_bot.py               # trade SYMBOL from the top of the file
-python3 deriv_bot.py BOOM1000      # trade another symbol without editing the file
-python3 deriv_bot.py --symbols     # just list all active Deriv symbols and exit
+python3 vera_bot.py               # trade SYMBOL from the top of the file
+python3 vera_bot.py BOOM1000      # trade another symbol without editing the file
+python3 vera_bot.py --symbols     # just list all active Deriv symbols and exit
 ```
 
 Symbol codes are case-sensitive (`BOOM1000`, not `boom1000`). If you mistype one, the bot suggests the correct code.
@@ -87,7 +87,7 @@ Stop it with **Ctrl+C**. In live mode the bot waits for an open contract to sett
 Run it in the background on a server:
 
 ```bash
-nohup python3 deriv_bot.py >> bot.log 2>&1 &
+nohup python3 vera_bot.py >> bot.log 2>&1 &
 tail -f bot.log
 ```
 
@@ -99,7 +99,7 @@ tail -f bot.log
 4. Subscribes to 1-minute candles with `ticks_history` (`style: candles`, `subscribe: 1`). This loads the last 100 candles and then streams every tick.
 5. When a candle closes, it recalculates MA7, MA14 and RSI14 with pandas and checks for a crossover that passes the RSI filter.
 6. On a signal it sends a `proposal` (`CALL`/`PUT` with a duration, or `MULTUP`/`MULTDOWN` with a multiplier), then a `buy`, then follows the contract with `proposal_open_contract`. Multiplier positions are closed with `sell` after `MULT_HOLD_SECONDS`, unless take profit, stop loss or a stop out closes them first.
-7. Logs each trade to the console and to `deriv_trades.csv`, updates the stake (martingale) and checks the daily limits.
+7. Logs each trade to the console and to `vera_trades.csv`, updates the stake (martingale) and checks the daily limits.
 
 Other behaviour:
 
@@ -115,7 +115,7 @@ Other behaviour:
 ## Notes
 
 - **Multipliers:** the most you can lose is the stake, and Deriv charges a commission. Boom/Crash have sudden spikes, so a position can be stopped out within seconds. In dry run, Multiplier P/L is estimated as `stake × multiplier × price change % − commission`. This is close to Deriv's figure but not exact.
-- If you upgraded from the earlier version, an existing `deriv_trades.csv` gets the new `rsi` column added automatically.
+- If you upgraded from the earlier version, an existing `deriv_trades.csv` is renamed to `vera_trades.csv` and gets the new `rsi` column added automatically.
 - Forex (`frx…`) only trades on weekdays, and Deriv does not offer tick-duration Rise/Fall on it. With `AUTO_ADJUST_DURATION` the bot picks the shortest allowed duration and prints it.
 - `app_id=1089` is Deriv's public test app id. For heavy use, register your own at https://api.deriv.com and change `APP_ID`.
 - Never commit your `.env`. It is already in `.gitignore`.
