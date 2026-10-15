@@ -82,6 +82,7 @@ DAILY_TAKE_PROFIT = 0        # stop when today's P/L reaches +X USD (0 = disable
 DRY_RUN = True               # True = simulate trades on live prices, no real buys
 DRY_RUN_START_BALANCE = 1000.0  # simulated balance when no token is set
 
+KEEPALIVE_SECONDS = 30      # send {"ping": 1} this often - Deriv drops idle connections
 APP_ID = os.getenv("DERIV_APP_ID", "").strip()   # your app ID from developers.deriv.com
 REST_URL = os.getenv("DERIV_REST_URL") or "https://api.derivws.com"
 LEGACY_WS_URL = "wss://ws.derivws.com/websockets/v3?app_id=1089"   # old-style tokens only
@@ -120,10 +121,11 @@ class DerivAPI:
         self._futures = {}      # req_id -> Future   (one-shot requests)
         self._queues = {}       # req_id -> Queue    (subscriptions)
         self._reader = None
+        self.close_info = ""
 
     async def connect(self):
         self.ws = await websockets.connect(
-            self.url, ping_interval=20, ping_timeout=20, max_size=2**22
+            self.url, ping_interval=30, ping_timeout=60, max_size=2**22
         )
         self._reader = asyncio.create_task(self._read_loop())
 
@@ -149,6 +151,9 @@ class DerivAPI:
         except Exception as e:  # noqa: BLE001 - surfaced to waiters below
             exc = e
         finally:
+            code = getattr(self.ws, "close_code", None)
+            reason = getattr(self.ws, "close_reason", "") or ""
+            self.close_info = f"code {code} {reason}".strip() if code else repr(exc)
             # wake everybody waiting so they can fail / reconnect
             for fut in self._futures.values():
                 if not fut.done():
@@ -288,6 +293,7 @@ class TradingBot:
         self.kind = "risefall"                  # or "multiplier" - set by resolve_contract()
         self.multiplier = MULTIPLIER
         self.symbols_shown = False
+        self.sim_balance_set = False
         self.symbol_key = "underlying_symbol"   # new API name; falls back to "symbol"
 
         self.closes = pd.Series(dtype=float)   # closed candles, index = open_time
@@ -352,8 +358,9 @@ class TradingBot:
                 self.currency = bal.get("currency") or self.currency
             except (DerivAPIError, KeyError, TypeError, ValueError):
                 balance = float(account.get("balance") or 0)
-            if not DRY_RUN:
-                self.balance = balance
+            if not DRY_RUN or not self.sim_balance_set:
+                self.balance = balance   # dry run: simulate from the real balance once
+                self.sim_balance_set = True
             kind = "DEMO" if self.is_virtual else "REAL"
             log(f"Logged in {self.account} ({kind}) balance {balance:.2f} {self.currency}")
             return
@@ -394,7 +401,12 @@ class TradingBot:
     async def resolve_contract(self):
         """Pick Rise/Fall or Multipliers for SYMBOL and check duration / multiplier."""
         try:
-            resp = await self.api.request({"contracts_for": SYMBOL, "currency": self.currency})
+            try:
+                resp = await self.api.request({"contracts_for": SYMBOL, "currency": self.currency})
+            except DerivAPIError as e:
+                if e.code != "InputValidationFailed":
+                    raise
+                resp = await self.api.request({"contracts_for": SYMBOL})   # new API: no currency
         except DerivAPIError as e:
             log(f"contracts_for failed ({e}); using Rise/Fall {DURATION}{DURATION_UNIT}")
             return
@@ -777,7 +789,7 @@ class TradingBot:
             except asyncio.TimeoutError:
                 continue
             if msg is None:
-                raise ConnectionError("candle stream closed")
+                raise ConnectionError(f"connection closed by server ({self.api.close_info})")
             if "error" in msg:
                 raise DerivAPIError(msg["error"])
             if msg["msg_type"] == "candles":
@@ -800,11 +812,21 @@ class TradingBot:
                 self.current_open_time, self.current_close = open_time, close
                 self.on_tick(epoch, close)
 
+    async def keepalive(self):
+        """Deriv closes connections that send nothing for ~2 minutes."""
+        while True:
+            await asyncio.sleep(KEEPALIVE_SECONDS)
+            try:
+                await self.api.request({"ping": 1}, timeout=20)
+            except DerivAPIError:
+                pass
+
     async def run_session(self):
         url, account = await get_session(self.token)
         self.api = DerivAPI(url)
         await self.api.connect()
         log(f"Connected to {url.split('?')[0]}")
+        pinger = asyncio.create_task(self.keepalive())
         try:
             await self.authorize(account)
             await self.load_active_symbols(show=SHOW_ACTIVE_SYMBOLS and not self.symbols_shown)
@@ -824,6 +846,7 @@ class TradingBot:
                     except asyncio.CancelledError:
                         log("Quit without waiting - the contract still settles on Deriv")
         finally:
+            pinger.cancel()
             if self.trade_task and not self.trade_task.done():
                 self.trade_task.cancel()
             await self.api.close()
@@ -837,6 +860,7 @@ class TradingBot:
         self.risk_allows(0)   # daily limit already hit earlier today?
         delay = 2
         while not self.stopped:
+            started = time.time()
             try:
                 await self.run_session()
                 delay = 2
@@ -850,6 +874,8 @@ class TradingBot:
                 log(f"Connection problem: {e!r}")
             if self.stopped:
                 break
+            if time.time() - started > 120:   # connection was healthy for a while
+                delay = 2
             log(f"Reconnecting in {delay}s...")
             try:
                 await asyncio.wait_for(self.stop_event.wait(), delay)
