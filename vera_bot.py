@@ -1267,16 +1267,19 @@ async def backtest(n_ticks):
 
         log(f"Backtest {SYMBOL}: downloading {n_ticks} ticks...")
         prices, times, end = [], [], "latest"
-        while len(prices) < n_ticks:
+        while len(prices) < n_ticks:   # the API sends up to 1000-5000 ticks per request
             want = min(5000, n_ticks - len(prices))
             hist = (await api.request({"ticks_history": SYMBOL, "end": end, "count": want,
                                        "style": "ticks"}, timeout=60)).get("history") or {}
             p, t = list(hist.get("prices") or []), list(hist.get("times") or [])
+            if times:   # keep only ticks older than what we already have
+                keep = [i for i, x in enumerate(t) if int(x) < int(times[0])]
+                p, t = [p[i] for i in keep], [t[i] for i in keep]
             if not p:
                 break
             prices, times, end = p + prices, t + times, int(t[0]) - 1
-            if len(p) < want:
-                break
+            if len(prices) % 10000 < len(p):
+                log(f"  {len(prices)} ticks...")
         if len(prices) < 500:
             raise SystemExit(f"Only {len(prices)} ticks available - not enough for a backtest")
         if decimals is None:
