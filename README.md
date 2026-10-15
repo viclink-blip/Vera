@@ -1,6 +1,6 @@
-# Deriv MA Crossover Bot
+# Vera Bot
 
-A Python bot for the [Deriv](https://deriv.com) WebSocket API that works with **any Deriv symbol**. It trades when a moving-average crossover happens on 1-minute candles, filtered by RSI.
+**Vera Bot** is a Python bot for the [Deriv](https://deriv.com) WebSocket API that works with **any Deriv symbol**. It trades when a moving-average crossover happens on 1-minute candles, filtered by RSI.
 
 - **Signal:** MA7 crosses above MA14 → **Rise / Up**. MA7 crosses below MA14 → **Fall / Down**.
 - **RSI(14) filter:** a Rise is skipped when RSI ≥ 70 (overbought) and a Fall is skipped when RSI ≤ 30 (oversold).

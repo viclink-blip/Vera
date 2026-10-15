@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Deriv MA-crossover trading bot.
+Vera Bot - MA-crossover trading bot for Deriv.
 
 Strategy : MA7 / MA14 crossover on 1-minute candles, filtered by RSI(14).
            MA7 crosses above MA14 (and RSI not overbought) -> Rise / Up
@@ -722,7 +722,7 @@ class TradingBot:
             await self.api.close()
 
     async def run(self):
-        log(f"Deriv bot | {self.mode} | {SYMBOL} | MA{MA_FAST}/MA{MA_SLOW} + RSI{RSI_PERIOD} on "
+        log(f"Vera Bot | {self.mode} | {SYMBOL} | MA{MA_FAST}/MA{MA_SLOW} + RSI{RSI_PERIOD} on "
             f"{CANDLE_GRANULARITY}s candles | stake {STAKE} | martingale {MARTINGALE} | "
             f"daily stop -{DAILY_STOP_LOSS} | today P/L {self.daily_pnl:+.2f}")
         if not DRY_RUN:
@@ -748,7 +748,7 @@ class TradingBot:
             except asyncio.TimeoutError:
                 pass
             delay = min(delay * 2, 60)
-        log(f"Bot stopped. {self.stop_reason} | today P/L {self.daily_pnl:+.2f} | "
+        log(f"Vera Bot stopped. {self.stop_reason} | today P/L {self.daily_pnl:+.2f} | "
             f"trades logged in {CSV_FILE.name}")
 
 
