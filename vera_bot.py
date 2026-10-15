@@ -16,11 +16,13 @@ Auth     : DERIV_TOKEN (pat_... personal access token) + DERIV_APP_ID in .env.
 Run      : python3 vera_bot.py              (uses SYMBOL below)
            python3 vera_bot.py BOOM1000     (override the symbol)
            python3 vera_bot.py --symbols    (list active symbols and exit)
+           python3 vera_bot.py --backtest   (test every contract type on recent ticks)
 """
 
 import asyncio
 import csv
 import json
+import math
 import os
 import signal
 import sys
@@ -63,8 +65,18 @@ SYMBOL = setting("SYMBOL", "R_75")  # any Deriv symbol, e.g. R_75, R_100, 1HZ100
                              # run `python3 vera_bot.py --symbols` to see them all
 SHOW_ACTIVE_SYMBOLS = True   # print every active Deriv symbol at startup
 
-CONTRACT_MODE = "auto"       # "auto": Rise/Fall when the symbol offers it, else Multipliers
-                             # "risefall" or "multiplier" to force one
+CONTRACT = setting("CONTRACT", "RISEFALL")  # what to trade:
+                             #   RISEFALL   - Rise/Fall by the MA/RSI signal (Multipliers if
+                             #                the symbol has no Rise/Fall, e.g. Boom/Crash)
+                             #   MULTIPLIER - Multipliers Up/Down by the MA/RSI signal
+                             #   DIGITEVEN, DIGITODD, DIGITMATCH, DIGITDIFF, DIGITOVER,
+                             #   DIGITUNDER - last-digit contracts (see DIGIT_BARRIER)
+                             #   AUTO       - before each trade, compare live payouts of all
+                             #                of the above and take the smallest Deriv edge
+DIGIT_BARRIER = setting("DIGIT_BARRIER", 5)  # the digit for MATCH / DIFF / OVER / UNDER
+DIGIT_TICKS = setting("DIGIT_TICKS", 5)      # digit contracts last this many ticks (1-10)
+CONTRACT_MODE = "auto"       # with CONTRACT = RISEFALL: "auto" falls back to Multipliers when
+                             # the symbol has no Rise/Fall; "risefall" never does
 STAKE = setting("STAKE", 1)  # USD per trade (Deriv minimum is 0.35)
 CURRENCY = "USD"
 
@@ -87,6 +99,8 @@ RSI_PERIOD = 14
 RSI_FILTER = True            # skip Rise when RSI >= RSI_OVERBOUGHT, Fall when RSI <= RSI_OVERSOLD
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
+
+BACKTEST_TICKS = 20000       # default history for `python3 vera_bot.py --backtest`
 
 MAX_OPEN_TRADES = setting("MAX_OPEN_TRADES", 3)  # trades allowed open at the same time
 TREND_TRADE_MINUTES = setting("TREND_TRADE_MINUTES", 6)  # no trade for this many minutes ->
@@ -229,6 +243,92 @@ def duration_to_seconds(value, unit):
     return value * {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 0)
 
 
+DIGIT_TYPES = ("DIGITEVEN", "DIGITODD", "DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER")
+DIGIT_NAMES = {"DIGITEVEN": "EVEN", "DIGITODD": "ODD", "DIGITMATCH": "MATCH",
+               "DIGITDIFF": "DIFF", "DIGITOVER": "OVER", "DIGITUNDER": "UNDER"}
+
+
+def needs_barrier(contract):
+    return contract in ("DIGITMATCH", "DIGITDIFF", "DIGITOVER", "DIGITUNDER")
+
+
+def digit_label(contract, barrier):
+    name = DIGIT_NAMES[contract]
+    return f"{name} {barrier}" if needs_barrier(contract) else name
+
+
+def digit_win_chance(contract, barrier):
+    """Exact chance to win - every last digit 0-9 is equally likely."""
+    if contract in ("DIGITEVEN", "DIGITODD"):
+        return 0.5
+    if contract == "DIGITMATCH":
+        return 0.1
+    if contract == "DIGITDIFF":
+        return 0.9
+    return (9 - barrier) / 10 if contract == "DIGITOVER" else barrier / 10
+
+
+def digit_wins(contract, barrier, digit):
+    if contract == "DIGITEVEN":
+        return digit % 2 == 0
+    if contract == "DIGITODD":
+        return digit % 2 == 1
+    if contract == "DIGITMATCH":
+        return digit == barrier
+    if contract == "DIGITDIFF":
+        return digit != barrier
+    return digit > barrier if contract == "DIGITOVER" else digit < barrier
+
+
+def last_digit(price, decimals):
+    return int(f"{float(price):.{decimals}f}"[-1])
+
+
+def pip_decimals(info):
+    pip = info.get("pip") or info.get("pip_size")
+    try:
+        return max(0, round(-math.log10(float(pip))))
+    except (TypeError, ValueError):
+        return None
+
+
+def auto_candidates():
+    b = DIGIT_BARRIER
+    return [("RISEFALL", None), ("DIGITEVEN", None), ("DIGITODD", None), ("DIGITDIFF", b),
+            ("DIGITMATCH", b), ("DIGITOVER", 1), ("DIGITUNDER", 8)]
+
+
+def compute_indicators(closes):
+    """MA_FAST, MA_SLOW and Wilder's RSI series for candle closes."""
+    fast = closes.rolling(MA_FAST).mean()
+    slow = closes.rolling(MA_SLOW).mean()
+    delta = closes.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
+    rsi = (100 - 100 / (1 + gain / loss)).fillna(100.0)   # no losses -> RSI 100
+    return fast, slow, rsi
+
+
+def decide(f_prev, s_prev, f_now, s_now, minutes_since_trade):
+    """Strategy: MA crossover, or a trend trade after TREND_TRADE_MINUTES without a trade.
+    Returns (direction, "cross" | "trend") or (None, None)."""
+    if f_prev <= s_prev and f_now > s_now:
+        return "RISE", "cross"
+    if f_prev >= s_prev and f_now < s_now:
+        return "FALL", "cross"
+    if TREND_TRADE_MINUTES and minutes_since_trade >= TREND_TRADE_MINUTES - 5 / 60:
+        return ("RISE" if f_now > s_now else "FALL"), "trend"
+    return None, None
+
+
+def rsi_allows(direction, rsi):
+    if not RSI_FILTER:
+        return True
+    if direction == "RISE":
+        return rsi < RSI_OVERBOUGHT
+    return rsi > RSI_OVERSOLD
+
+
 def parse_duration(text):
     """'5t' -> (5, 't'), '15m' -> (15, 'm')"""
     return int(text[:-1]), text[-1]
@@ -316,7 +416,11 @@ class TradingBot:
         self.currency = CURRENCY
         self.duration = DURATION
         self.duration_unit = DURATION_UNIT
-        self.kind = "risefall"                  # or "multiplier" - set by resolve_contract()
+        self.kind = "risefall"                  # risefall / multiplier / digit / auto
+        self.contract = "RISEFALL"              # set by resolve_contract()
+        self.available_types = set()
+        self.auto_risefall = True
+        self.decimals = None                    # price decimals, for last digits
         self.multiplier = MULTIPLIER
         self.symbols_shown = False
         self.sim_balance_set = False
@@ -440,6 +544,7 @@ class TradingBot:
                     if SYMBOL.lower() in (c.lower(), sym.get("display_name", "").lower())]
             hint = f" Did you mean {hits[0]}?" if hits else " Run with --symbols to list them."
             raise SystemExit(f"Symbol {SYMBOL!r} is not an active Deriv symbol.{hint}")
+        self.decimals = pip_decimals(info) if pip_decimals(info) is not None else self.decimals
         status = "OPEN" if info.get("exchange_is_open") else "CLOSED"
         if info.get("is_trading_suspended"):
             status = "SUSPENDED"
@@ -449,6 +554,35 @@ class TradingBot:
             log("Market not open now - trades will be rejected until it opens")
 
     async def resolve_contract(self):
+        """Check CONTRACT against what SYMBOL offers and set duration / multiplier."""
+        contract = str(CONTRACT).upper()
+        if contract not in ("RISEFALL", "MULTIPLIER", "AUTO") + DIGIT_TYPES:
+            raise SystemExit(f"Unknown CONTRACT {CONTRACT!r}. Use RISEFALL, MULTIPLIER, AUTO or "
+                             f"{', '.join(DIGIT_TYPES)}")
+        if contract in ("DIGITOVER", "DIGITUNDER", "DIGITMATCH", "DIGITDIFF"):
+            lo, hi = {"DIGITOVER": (0, 8), "DIGITUNDER": (1, 9)}.get(contract, (0, 9))
+            if not lo <= DIGIT_BARRIER <= hi:
+                raise SystemExit(f"DIGIT_BARRIER for {contract} must be {lo}-{hi}")
+        await self._resolve_direction_contract("multiplier" if contract == "MULTIPLIER" else CONTRACT_MODE)
+        self.contract = "MULTIPLIER" if self.kind == "multiplier" else "RISEFALL"
+        if contract in ("RISEFALL", "MULTIPLIER"):
+            if self.kind == "multiplier":
+                log(f"Contract: Multipliers Up/Down x{self.multiplier}, close after {MULT_HOLD_SECONDS}s")
+            else:
+                log(f"Contract: Rise/Fall {self.duration_label(self.contract)}")
+        if contract in DIGIT_TYPES:
+            if self.available_types and contract not in self.available_types:
+                raise SystemExit(f"{contract} is not offered for {SYMBOL}")
+            self.contract, self.kind = contract, "digit"
+            log(f"Contract: {digit_label(contract, DIGIT_BARRIER)} over {DIGIT_TICKS} ticks "
+                f"(win chance {digit_win_chance(contract, DIGIT_BARRIER):.0%})")
+        elif contract == "AUTO":
+            self.auto_risefall = self.contract == "RISEFALL"
+            self.kind = "auto"
+            log("Contract: AUTO - before each trade, compares live payouts and takes the "
+                "smallest Deriv edge")
+
+    async def _resolve_direction_contract(self, mode):
         """Pick Rise/Fall or Multipliers for SYMBOL and check duration / multiplier."""
         try:
             try:
@@ -461,6 +595,7 @@ class TradingBot:
             log(f"contracts_for failed ({e}); using Rise/Fall {DURATION}{DURATION_UNIT}")
             return
         available = resp["contracts_for"]["available"]
+        self.available_types = {c.get("contract_type") for c in available}
         calls = [c for c in available if c.get("contract_type") == "CALL"]
         # Rise/Fall = CALL without barriers. Field formats differ between API
         # versions (barriers 0 / "0" / missing), so only rule out clear mismatches.
@@ -473,7 +608,7 @@ class TradingBot:
         types = sorted({c["contract_type"] for c in available})
         log(f"Contract types for {SYMBOL}: {', '.join(types)}")
 
-        if CONTRACT_MODE == "multiplier" or (CONTRACT_MODE == "auto" and not offers):
+        if mode == "multiplier" or (mode == "auto" and not offers):
             if not mult_offers:
                 raise SystemExit(f"Neither Rise/Fall nor Multipliers are offered for {SYMBOL}")
             self.kind = "multiplier"
@@ -482,7 +617,6 @@ class TradingBot:
                 self.multiplier = min(allowed_mults, key=lambda m: (abs(m - MULTIPLIER), m))
                 log(f"Multiplier x{MULTIPLIER} not offered for {SYMBOL}; using x{self.multiplier} "
                     f"(allowed {allowed_mults})")
-            log(f"Contract: Multipliers Up/Down x{self.multiplier}, close after {MULT_HOLD_SECONDS}s")
             return
         if not offers:
             raise SystemExit(f"Rise/Fall is not offered for {SYMBOL} (types: {', '.join(types)})")
@@ -496,7 +630,7 @@ class TradingBot:
             except (KeyError, ValueError, TypeError, IndexError):
                 pass
         if not ranges:   # duration format unknown - let the proposal validate it
-            log(f"Contract: Rise/Fall {DURATION}{DURATION_UNIT} (durations not listed: "
+            log(f"Rise/Fall {DURATION}{DURATION_UNIT} (durations not listed: "
                 f"{json.dumps(offers[0])[:300]})")
             return
 
@@ -511,7 +645,6 @@ class TradingBot:
             return False
 
         if allowed(DURATION, DURATION_UNIT):
-            log(f"Contract: Rise/Fall {DURATION}{DURATION_UNIT}")
             return
         mins = [lo for lo, _ in ranges]
         if not AUTO_ADJUST_DURATION:
@@ -529,14 +662,6 @@ class TradingBot:
         slow = self.closes.rolling(MA_SLOW).mean()
         return fast, slow
 
-    def _rsi(self):
-        """Wilder's RSI on candle closes."""
-        delta = self.closes.diff()
-        gain = delta.clip(lower=0).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-        loss = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
-        rs = gain / loss
-        return (100 - 100 / (1 + rs)).fillna(100.0).iloc[-1]   # no losses -> RSI 100
-
     def on_candle_closed(self, open_time, close):
         self.closes.loc[open_time] = close
         self.closes = self.closes.iloc[-300:]
@@ -544,38 +669,31 @@ class TradingBot:
         if len(self.closes) < need:
             log(f"Collecting candles {len(self.closes)}/{need}")
             return
-        fast, slow = self._ma()
+        fast, slow, rsi_s = compute_indicators(self.closes)
         f_prev, s_prev, f_now, s_now = fast.iloc[-2], slow.iloc[-2], fast.iloc[-1], slow.iloc[-1]
-        rsi = self._rsi()
+        rsi = rsi_s.iloc[-1]
         log(f"{SYMBOL} candle close {close} | MA{MA_FAST}={f_now:.5f} MA{MA_SLOW}={s_now:.5f} "
             f"RSI{RSI_PERIOD}={rsi:.1f}")
 
-        direction = None
-        if f_prev <= s_prev and f_now > s_now:
-            direction = "RISE"
-        elif f_prev >= s_prev and f_now < s_now:
-            direction = "FALL"
-        if direction:
-            log(f">>> Signal {direction}: MA{MA_FAST} crossed {'above' if direction == 'RISE' else 'below'} "
-                f"MA{MA_SLOW} | RSI {rsi:.1f}")
-        elif TREND_TRADE_MINUTES and time.time() - self.last_trade_time >= TREND_TRADE_MINUTES * 60 - 5:
-            direction = "RISE" if f_now > s_now else "FALL"
-            log(f">>> Trend trade {direction}: no trade for {TREND_TRADE_MINUTES} min, MA{MA_FAST} "
-                f"{'above' if direction == 'RISE' else 'below'} MA{MA_SLOW} | RSI {rsi:.1f}")
+        direction, why = decide(f_prev, s_prev, f_now, s_now, (time.time() - self.last_trade_time) / 60)
         if not direction:
             return
-        if RSI_FILTER:
-            if direction == "RISE" and rsi >= RSI_OVERBOUGHT:
-                log(f"RSI {rsi:.1f} >= {RSI_OVERBOUGHT} (overbought) - Rise skipped")
-                return
-            if direction == "FALL" and rsi <= RSI_OVERSOLD:
-                log(f"RSI {rsi:.1f} <= {RSI_OVERSOLD} (oversold) - Fall skipped")
-                return
+        side = "above" if direction == "RISE" else "below"
+        if why == "cross":
+            log(f">>> Signal {direction}: MA{MA_FAST} crossed {side} MA{MA_SLOW} | RSI {rsi:.1f}")
+        else:
+            log(f">>> Trend trade {direction}: no trade for {TREND_TRADE_MINUTES} min, MA{MA_FAST} "
+                f"{side} MA{MA_SLOW} | RSI {rsi:.1f}")
+        rsi_ok = rsi_allows(direction, rsi)
+        if not rsi_ok and self.kind in ("risefall", "multiplier"):
+            limit = f">= {RSI_OVERBOUGHT} (overbought)" if direction == "RISE" else f"<= {RSI_OVERSOLD} (oversold)"
+            log(f"RSI {rsi:.1f} {limit} - {direction.title()} skipped")
+            return
         if len(self.trade_tasks) >= MAX_OPEN_TRADES:
             log(f"{len(self.trade_tasks)} trades already open (MAX_OPEN_TRADES) - signal skipped")
             return
         self.last_trade_time = time.time()
-        self.start_task(self.trade(direction, f_now, s_now, rsi))
+        self.start_task(self.trade(direction, f_now, s_now, rsi, rsi_ok))
 
     def start_task(self, coro):
         task = asyncio.create_task(coro)
@@ -650,11 +768,17 @@ class TradingBot:
             log(f"Martingale: next stake {self.stake:.2f}")
 
     # -------------------------------------------------------------- trading
-    def proposal_request(self, direction, stake):
-        """Build the proposal for the contract kind SYMBOL supports."""
+    def proposal_request(self, direction, stake, contract, barrier=None):
+        """Build the proposal for one contract (RISEFALL, MULTIPLIER or a DIGIT type)."""
         req = {"proposal": 1, "amount": stake, "basis": "stake",
                "currency": self.currency, self.symbol_key: SYMBOL}
-        if self.kind == "multiplier":
+        if contract in DIGIT_TYPES:
+            req["contract_type"] = contract
+            req["duration"] = DIGIT_TICKS
+            req["duration_unit"] = "t"
+            if needs_barrier(contract):
+                req["barrier"] = str(barrier)
+        elif contract == "MULTIPLIER":
             req["contract_type"] = "MULTUP" if direction == "RISE" else "MULTDOWN"
             req["multiplier"] = self.multiplier
             limit = {}
@@ -670,55 +794,90 @@ class TradingBot:
             req["duration_unit"] = self.duration_unit
         return req
 
-    @property
-    def duration_label(self):
-        if self.kind == "multiplier":
+    def duration_label(self, contract):
+        if contract == "MULTIPLIER":
             return f"x{self.multiplier}/{MULT_HOLD_SECONDS}s"
+        if contract in DIGIT_TYPES:
+            return f"{DIGIT_TICKS}t"
         return f"{self.duration}{self.duration_unit}"
 
-    async def trade(self, direction, ma_fast, ma_slow, rsi):
+    async def request_proposal(self, req):
+        try:
+            return (await self.api.request(req))["proposal"]
+        except DerivAPIError as e:
+            if e.code != "InputValidationFailed":
+                raise
+            # API version uses the other field name for the symbol - switch and retry
+            other = "symbol" if self.symbol_key == "underlying_symbol" else "underlying_symbol"
+            req[other] = req.pop(self.symbol_key)
+            proposal = (await self.api.request(req))["proposal"]
+            self.symbol_key = other
+            return proposal
+
+    async def pick_contract(self, direction, stake, rsi_ok):
+        """Returns (contract, barrier, request, proposal) for this trade."""
+        if self.kind != "auto":
+            req = self.proposal_request(direction, stake, self.contract, DIGIT_BARRIER)
+            return self.contract, DIGIT_BARRIER, req, await self.request_proposal(req)
+        best, report = None, []
+        for contract, barrier in auto_candidates():
+            if contract == "RISEFALL" and not (self.auto_risefall and rsi_ok):
+                continue
+            if contract != "RISEFALL" and self.available_types and contract not in self.available_types:
+                continue
+            req = self.proposal_request(direction, stake, contract, barrier)
+            try:
+                proposal = await self.request_proposal(req)
+            except DerivAPIError:
+                continue
+            payout = float(proposal.get("payout") or 0)
+            chance = 0.5 if contract == "RISEFALL" else digit_win_chance(contract, barrier)
+            edge = chance * payout / stake - 1
+            name = direction if contract == "RISEFALL" else digit_label(contract, barrier)
+            report.append(f"{name} {edge:+.1%}")
+            if best is None or edge > best[0]:
+                best = (edge, name, contract, barrier, req, proposal)
+        if best is None:
+            raise DerivAPIError({"code": "NoContract", "message": "no contract could be priced"})
+        log(f"AUTO expected return per trade: {' | '.join(report)} -> {best[1]}")
+        return best[2:]
+
+    async def trade(self, direction, ma_fast, ma_slow, rsi, rsi_ok=True):
         stake = round(self.stake, 2)
         if self.stopped or not self.risk_allows(stake):
             return
         self.open_stake = round(self.open_stake + stake, 2)
         try:
-            await self._trade(direction, stake, ma_fast, ma_slow, rsi)
+            await self._trade(direction, stake, ma_fast, ma_slow, rsi, rsi_ok)
         finally:
             self.open_stake = round(self.open_stake - stake, 2)
 
-    async def _trade(self, direction, stake, ma_fast, ma_slow, rsi):
-        req = self.proposal_request(direction, stake)
-        contract_type = req["contract_type"]
+    async def _trade(self, direction, stake, ma_fast, ma_slow, rsi, rsi_ok):
         try:
-            try:
-                proposal = (await self.api.request(req))["proposal"]
-            except DerivAPIError as e:
-                if e.code != "InputValidationFailed":
-                    raise
-                # API version uses the other field name for the symbol - switch and retry
-                other = "symbol" if self.symbol_key == "underlying_symbol" else "underlying_symbol"
-                req[other] = req.pop(self.symbol_key)
-                proposal = (await self.api.request(req))["proposal"]
-                self.symbol_key = other
+            contract, barrier, req, proposal = await self.pick_contract(direction, stake, rsi_ok)
         except DerivAPIError as e:
             log(f"Proposal rejected: {e}")
             return
+        contract_type = req["contract_type"]
+        label = digit_label(contract, barrier) if contract in DIGIT_TYPES else direction
+        duration = self.duration_label(contract)
         payout = float(proposal.get("payout") or 0)
         extra = (f"x{self.multiplier} commission {float(proposal.get('commission') or 0):.2f}"
-                 if self.kind == "multiplier" else f"payout {payout:.2f}")
-        log(f"Proposal {contract_type} {SYMBOL} stake {stake:.2f} {extra} spot {proposal.get('spot')}")
+                 if contract == "MULTIPLIER" else f"payout {payout:.2f}")
+        log(f"Proposal {contract_type}{' ' + str(barrier) if needs_barrier(contract) else ''} "
+            f"{SYMBOL} stake {stake:.2f} {extra} spot {proposal.get('spot')}")
 
         if DRY_RUN:
-            if self.kind == "multiplier":
+            if contract == "MULTIPLIER":
                 entry, exit_, profit = await self.simulate_multiplier(
                     contract_type, stake, float(proposal.get("commission") or 0))
                 won = profit > 0
             else:
-                entry, exit_, won = await self.simulate(contract_type)
+                entry, exit_, won = await self.simulate(contract_type, barrier)
                 profit = round(payout - stake, 2) if won else -stake
             self.balance = round(self.balance + profit, 2)
-            self.finish_trade(direction, contract_type, stake, ma_fast, ma_slow, rsi,
-                              entry, exit_, payout, won, profit, "dry-run")
+            self.finish_trade(label, contract_type, stake, ma_fast, ma_slow, rsi,
+                              entry, exit_, payout, won, profit, "dry-run", duration)
             return
 
         try:
@@ -729,9 +888,10 @@ class TradingBot:
         contract_id = buy["contract_id"]
         log(f"BOUGHT {contract_type} #{contract_id} for {float(buy['buy_price']):.2f} "
             f"(balance {float(buy['balance_after']):.2f})")
-        info = dict(direction=direction, contract_type=contract_type, stake=stake,
-                    ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi,
-                    contract_id=contract_id, kind=self.kind,
+        info = dict(direction=label, contract_type=contract_type, stake=stake,
+                    ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi, duration=duration,
+                    contract_id=contract_id,
+                    kind="multiplier" if contract == "MULTIPLIER" else "fixed",
                     sell_at=time.time() + MULT_HOLD_SECONDS)
         self.pending_contracts[contract_id] = info
         await self.watch_contract(info)
@@ -780,7 +940,8 @@ class TradingBot:
                           info["ma_fast"], info["ma_slow"], info["rsi"],
                           poc.get("entry_spot") or poc.get("entry_tick"),
                           poc.get("exit_tick") or poc.get("sell_spot") or poc.get("current_spot"),
-                          float(poc.get("payout", 0)), profit > 0, profit, info["contract_id"])
+                          float(poc.get("payout", 0)), profit > 0, profit, info["contract_id"],
+                          info.get("duration"))
 
     async def sell(self, contract_id):
         """Close an open contract (Multipliers) at market price."""
@@ -817,14 +978,16 @@ class TradingBot:
             self.tick_listeners.remove(listener)
         return state["entry"], exit_spot, profit
 
-    async def simulate(self, contract_type):
+    async def simulate(self, contract_type, barrier=None):
         """Dry run: mimic Deriv settlement on the live price feed.
         Entry = first tick after purchase; exit = Nth tick after entry
         (tick contracts) or the last tick at/before expiry (time contracts)."""
         loop = asyncio.get_running_loop()
         done = loop.create_future()
         state = {"entry": None, "entry_epoch": None, "ticks": 0, "last": None}
-        expiry_secs = duration_to_seconds(self.duration, self.duration_unit)
+        digit = contract_type in DIGIT_TYPES
+        dur, unit = (DIGIT_TICKS, "t") if digit else (self.duration, self.duration_unit)
+        expiry_secs = duration_to_seconds(dur, unit)
 
         def listener(epoch, quote):
             if done.done():
@@ -833,8 +996,8 @@ class TradingBot:
                 state.update(entry=quote, entry_epoch=epoch)
                 return
             state["ticks"] += 1
-            if self.duration_unit == "t":
-                if state["ticks"] >= self.duration:
+            if unit == "t":
+                if state["ticks"] >= dur:
                     done.set_result(quote)
             elif epoch >= state["entry_epoch"] + expiry_secs:
                 done.set_result(quote if epoch == state["entry_epoch"] + expiry_secs else state["last"])
@@ -842,16 +1005,19 @@ class TradingBot:
 
         self.tick_listeners.append(listener)
         try:
-            timeout = 120 if self.duration_unit == "t" else expiry_secs + 120
+            timeout = 120 if unit == "t" else expiry_secs + 120
             exit_spot = await asyncio.wait_for(done, timeout)
         finally:
             self.tick_listeners.remove(listener)
         entry = state["entry"]
-        won = exit_spot > entry if contract_type == "CALL" else exit_spot < entry
+        if digit:
+            won = digit_wins(contract_type, barrier, last_digit(exit_spot, self.decimals or 2))
+        else:
+            won = exit_spot > entry if contract_type == "CALL" else exit_spot < entry
         return entry, exit_spot, won
 
     def finish_trade(self, direction, contract_type, stake, ma_fast, ma_slow, rsi,
-                     entry, exit_spot, payout, won, profit, contract_id):
+                     entry, exit_spot, payout, won, profit, contract_id, duration=None):
         self.check_day_rollover()
         self.daily_pnl = round(self.daily_pnl + profit, 2)
         result = "WIN" if won else "LOSS"
@@ -860,7 +1026,7 @@ class TradingBot:
         row = {
             "time": now_utc().isoformat(timespec="seconds"), "mode": self.mode,
             "account": self.account, "symbol": SYMBOL, "direction": direction,
-            "contract_type": contract_type, "duration": self.duration_label,
+            "contract_type": contract_type, "duration": duration or self.duration_label(self.contract),
             "stake": f"{stake:.2f}", "ma_fast": f"{ma_fast:.5f}", "ma_slow": f"{ma_slow:.5f}",
             "rsi": f"{rsi:.1f}",
             "entry_spot": entry, "exit_spot": exit_spot, "payout": f"{payout:.2f}",
@@ -905,6 +1071,8 @@ class TradingBot:
                     f"MA{MA_FAST}={fast.iloc[-1]:.5f} MA{MA_SLOW}={slow.iloc[-1]:.5f}")
             elif msg["msg_type"] == "ohlc":
                 o = msg["ohlc"]
+                if self.decimals is None and isinstance(o["close"], str) and "." in o["close"]:
+                    self.decimals = len(o["close"].split(".")[1])
                 open_time, close, epoch = int(o["open_time"]), float(o["close"]), int(o["epoch"])
                 if self.current_open_time is not None and open_time > self.current_open_time:
                     self.on_candle_closed(self.current_open_time, self.current_close)
@@ -1080,6 +1248,150 @@ def print_symbols(symbols):
     print(flush=True)
 
 
+async def backtest(n_ticks):
+    """Replay the strategy on recent ticks for every contract type, priced with live payouts."""
+    import numpy as np
+    token = os.getenv("DERIV_TOKEN", "").strip()
+    url, account = await get_session(token)
+    api = DerivAPI(url)
+    await api.connect()
+    try:
+        if account is None and token and not API_URL:
+            await api.request({"authorize": token})
+        currency = (account or {}).get("currency") or CURRENCY
+        symbols = [normalize_symbol(x) for x in (await api.request({"active_symbols": "brief"}))["active_symbols"]]
+        info = next((x for x in symbols if x["symbol"] == SYMBOL), None)
+        if info is None:
+            raise SystemExit(f"Symbol {SYMBOL!r} is not an active Deriv symbol")
+        decimals = pip_decimals(info)
+
+        log(f"Backtest {SYMBOL}: downloading {n_ticks} ticks...")
+        prices, times, end = [], [], "latest"
+        while len(prices) < n_ticks:
+            want = min(5000, n_ticks - len(prices))
+            hist = (await api.request({"ticks_history": SYMBOL, "end": end, "count": want,
+                                       "style": "ticks"}, timeout=60)).get("history") or {}
+            p, t = list(hist.get("prices") or []), list(hist.get("times") or [])
+            if not p:
+                break
+            prices, times, end = p + prices, t + times, int(t[0]) - 1
+            if len(p) < want:
+                break
+        if len(prices) < 500:
+            raise SystemExit(f"Only {len(prices)} ticks available - not enough for a backtest")
+        if decimals is None:
+            decimals = max(len(str(x).split(".")[1]) if "." in str(x) else 0 for x in prices[-500:])
+        price = np.array([float(x) for x in prices])
+        epoch = np.array([int(x) for x in times])
+        digits = np.array([last_digit(x, decimals) for x in price])
+
+        # live payouts for each contract, priced once at STAKE
+        try:
+            avail = (await api.request({"contracts_for": SYMBOL}))["contracts_for"]["available"]
+            types = {c.get("contract_type") for c in avail}
+        except DerivAPIError:
+            types = set()
+        key = ["underlying_symbol"]
+
+        async def payout_for(contract_type, extra):
+            req = {"proposal": 1, "amount": STAKE, "basis": "stake", "currency": currency,
+                   key[0]: SYMBOL, "contract_type": contract_type, **extra}
+            try:
+                return float((await api.request(req))["proposal"]["payout"])
+            except DerivAPIError as e:
+                if e.code != "InputValidationFailed" or key[0] == "symbol":
+                    return None
+                key[0] = "symbol"
+                return await payout_for(contract_type, extra)
+
+        candidates = auto_candidates()
+        if str(CONTRACT).upper() in DIGIT_TYPES and (str(CONTRACT).upper(), DIGIT_BARRIER) not in candidates:
+            candidates.append((str(CONTRACT).upper(), DIGIT_BARRIER if needs_barrier(str(CONTRACT).upper()) else None))
+        payouts = {}
+        for contract, barrier in candidates:
+            if contract == "RISEFALL":
+                for ct in ("CALL", "PUT"):
+                    payouts[(ct, None)] = await payout_for(ct, {"duration": DURATION, "duration_unit": DURATION_UNIT})
+            elif not types or contract in types:
+                extra = {"duration": DIGIT_TICKS, "duration_unit": "t"}
+                if needs_barrier(contract):
+                    extra["barrier"] = str(barrier)
+                payouts[(contract, barrier)] = await payout_for(contract, extra)
+    finally:
+        await api.close()
+
+    # 1-minute candles from the ticks, then the same decisions as live trading
+    minute = epoch // CANDLE_GRANULARITY * CANDLE_GRANULARITY
+    closes = pd.Series(price).groupby(minute).last().iloc[:-1]   # last candle still forming
+    fast, slow, rsi = (x.to_numpy() for x in compute_indicators(closes))
+    candle_end = closes.index.to_numpy() + CANDLE_GRANULARITY
+    need = max(MA_SLOW, RSI_PERIOD) + 1
+
+    def run(contract, barrier):
+        direction_based = contract == "RISEFALL"
+        results, last_trade = [], candle_end[0]
+        for i in range(need, len(closes)):
+            d, _ = decide(fast[i - 1], slow[i - 1], fast[i], slow[i], (candle_end[i] - last_trade) / 60)
+            if not d or (direction_based and not rsi_allows(d, rsi[i])):
+                continue
+            last_trade = candle_end[i]
+            entry = int(np.searchsorted(epoch, candle_end[i]))     # first tick after the decision
+            if contract in DIGIT_TYPES:
+                exit_ = entry + DIGIT_TICKS
+                if exit_ >= len(price):
+                    break
+                won = digit_wins(contract, barrier, int(digits[exit_]))
+                pay = payouts.get((contract, barrier))
+            else:
+                if DURATION_UNIT == "t":
+                    exit_ = entry + DURATION
+                else:
+                    exit_ = int(np.searchsorted(epoch, epoch[min(entry, len(epoch) - 1)]
+                                                + duration_to_seconds(DURATION, DURATION_UNIT), "right")) - 1
+                if exit_ >= len(price) or entry >= len(price):
+                    break
+                ct = "CALL" if d == "RISE" else "PUT"
+                won = price[exit_] > price[entry] if ct == "CALL" else price[exit_] < price[entry]
+                pay = payouts.get((ct, None))
+            if not pay:
+                return None
+            results.append(pay - STAKE if won else -STAKE)
+        return results
+
+    hours = (epoch[-1] - epoch[0]) / 3600
+    print(f"\n===== Backtest {SYMBOL}: {len(price)} ticks, {len(closes)} candles, "
+          f"{hours:.1f} h, stake {STAKE} {currency} =====")
+    print(f"Strategy: MA{MA_FAST}/MA{MA_SLOW} crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} "
+          f"min, RSI filter {'on' if RSI_FILTER else 'off'} (Rise/Fall only)\n")
+    print(f"{'Contract':<14}{'Trades':>7}{'Win %':>8}{'± luck':>8}{'Need %':>8}{'Payout':>9}{'P/L':>11}"
+          f"{'Per trade':>11}{'Worst run':>11}")
+    rows = []
+    for contract, barrier in candidates:
+        name = f"Rise/Fall {DURATION}{DURATION_UNIT}" if contract == "RISEFALL" else \
+            f"{digit_label(contract, barrier)} {DIGIT_TICKS}t"
+        res = run(contract, barrier)
+        if not res:
+            print(f"{name:<14}  not offered / no trades")
+            continue
+        wins = sum(1 for r in res if r > 0)
+        streak = worst = 0
+        for r in res:
+            streak = streak + 1 if r < 0 else 0
+            worst = max(worst, streak)
+        pay = max(r for r in res) + STAKE if wins else payouts.get((contract, barrier)) or 0
+        rows.append((sum(res) / len(res), name))
+        chance = 0.5 if contract == "RISEFALL" else digit_win_chance(contract, barrier)
+        luck = 2 * math.sqrt(chance * (1 - chance) / len(res))   # 95% range from luck alone
+        print(f"{name:<14}{len(res):>7}{wins / len(res):>8.1%}{luck:>8.1%}{STAKE / pay:>8.1%}{pay:>9.2f}"
+              f"{sum(res):>+11.2f}{sum(res) / len(res):>+11.2f}{worst:>9} L")
+    if rows:
+        best = max(rows)
+        print(f"\nBest here: {best[1]} ({best[0]:+.2f} per trade).\n"
+              "'Need %' = win rate that breaks even. '± luck' = how far Win % can move by pure chance\n"
+              "with this many trades. A result only means something if Win % beats Need % by more\n"
+              "than the luck range - otherwise it's luck. More ticks (--backtest 100000) = less luck.")
+
+
 async def list_symbols():
     url, account = await get_session(os.getenv("DERIV_TOKEN", "").strip())
     api = DerivAPI(url)
@@ -1101,6 +1413,11 @@ async def main():
     args = sys.argv[1:]
     if not API_URL:
         check_env()
+    if "--backtest" in args:
+        i = args.index("--backtest")
+        n = int(args[i + 1]) if len(args) > i + 1 and args[i + 1].isdigit() else BACKTEST_TICKS
+        await backtest(n)
+        return
     if "--symbols" in args:
         try:
             await list_symbols()

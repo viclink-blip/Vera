@@ -49,14 +49,17 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES` and `VERA_WAIT_NEXT_DAY`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `ACCOUNT_TYPE` | `"demo"` | `"demo"` or `"real"`: which of your Deriv accounts to use |
 | `SYMBOL` | `"R_75"` | Any Deriv symbol: `BOOM1000`, `CRASH500`, `frxEURUSD`, `frxXAUUSD`… |
 | `SHOW_ACTIVE_SYMBOLS` | `True` | Print all active symbols at startup |
-| `CONTRACT_MODE` | `"auto"` | `"auto"`, `"risefall"` or `"multiplier"` |
+| `CONTRACT` | `"RISEFALL"` | What to trade: `RISEFALL`, `MULTIPLIER`, `DIGITEVEN`, `DIGITODD`, `DIGITMATCH`, `DIGITDIFF`, `DIGITOVER`, `DIGITUNDER`, or `AUTO` (before each trade, compare live payouts of all of them and take the one with the smallest Deriv edge) |
+| `DIGIT_BARRIER` | `5` | The digit for Matches / Differs / Over / Under (Over 0-8, Under 1-9) |
+| `DIGIT_TICKS` | `5` | Length of digit contracts in ticks (1-10) |
+| `CONTRACT_MODE` | `"auto"` | With `CONTRACT = RISEFALL`: `"auto"` falls back to Multipliers when the symbol has no Rise/Fall; `"risefall"` never does |
 | `STAKE` | `1` | USD per trade (Deriv minimum 0.35) |
 | `DURATION` / `DURATION_UNIT` | `5`, `"t"` | Contract length: 5 ticks. Use `1`, `"m"` for 1 minute |
 | `AUTO_ADJUST_DURATION` | `True` | Switches to the shortest duration Deriv allows if the one you set isn't offered (forex has no tick contracts) |
@@ -101,6 +104,15 @@ Run it in the background on a server:
 nohup python3 vera_bot.py >> bot.log 2>&1 &
 tail -f bot.log
 ```
+
+## Backtest: test before you trade
+
+```bash
+python3 vera_bot.py --backtest            # last 20,000 ticks of SYMBOL
+python3 vera_bot.py --backtest 100000     # more history = more reliable
+```
+
+The backtest downloads recent ticks, runs the same strategy as live trading, and settles every contract type (Rise/Fall, Even, Odd, Differs, Matches, Over, Under) with Deriv's current payouts. It prints the number of trades, the win rate, the luck range, the break-even win rate, P/L and the worst losing streak for each. A contract only makes money if its win rate beats the break-even rate by more than the luck range over many trades.
 
 ## Run it 24 hours a day
 
