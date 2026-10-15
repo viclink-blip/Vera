@@ -49,7 +49,7 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`:
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT` and `VERA_MARTINGALE`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|

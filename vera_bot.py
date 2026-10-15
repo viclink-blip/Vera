@@ -37,19 +37,35 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"))
 
-# ============================================================================
-#  SETTINGS - edit these
-# ============================================================================
-ACCOUNT_TYPE = "demo"        # "demo" or "real" - which of your Deriv accounts to use
 
-SYMBOL = "R_75"              # any Deriv symbol, e.g. R_75, R_100, 1HZ100V, BOOM1000,
+def setting(name, default):
+    """A setting from .env if present (VERA_<NAME>=...), else the default below.
+    Keeping your own values in .env means `git pull` never conflicts with them."""
+    raw = os.getenv(f"VERA_{name}")
+    if raw is None or raw.strip() == "":
+        return default
+    raw = raw.strip()
+    if isinstance(default, bool):
+        return raw.lower() in ("1", "true", "yes", "on")
+    if isinstance(default, (int, float)):
+        value = float(raw)
+        return int(value) if value.is_integer() else value
+    return raw
+
+# ============================================================================
+#  SETTINGS - edit these, or override them in .env as VERA_<NAME>=value
+#  (e.g. VERA_STAKE=50, VERA_DRY_RUN=false) so `git pull` never conflicts
+# ============================================================================
+ACCOUNT_TYPE = setting("ACCOUNT_TYPE", "demo")  # "demo" or "real" - which of your Deriv accounts to use
+
+SYMBOL = setting("SYMBOL", "R_75")  # any Deriv symbol, e.g. R_75, R_100, 1HZ100V, BOOM1000,
                              # CRASH500, JD25, frxEURUSD, frxXAUUSD, cryBTCUSD ...
                              # run `python3 vera_bot.py --symbols` to see them all
 SHOW_ACTIVE_SYMBOLS = True   # print every active Deriv symbol at startup
 
 CONTRACT_MODE = "auto"       # "auto": Rise/Fall when the symbol offers it, else Multipliers
                              # "risefall" or "multiplier" to force one
-STAKE = 1                    # USD per trade (Deriv minimum is 0.35)
+STAKE = setting("STAKE", 1)  # USD per trade (Deriv minimum is 0.35)
 CURRENCY = "USD"
 
 DURATION = 5                 # contract length...
@@ -72,17 +88,17 @@ RSI_FILTER = True            # skip Rise when RSI >= RSI_OVERBOUGHT, Fall when R
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
-MARTINGALE = False           # after a loss, next stake = previous stake x MULTIPLIER
+MARTINGALE = setting("MARTINGALE", False)  # after a loss, next stake = previous stake x MULTIPLIER
 MARTINGALE_MULTIPLIER = 2.1
 MARTINGALE_MAX_STEPS = 5     # reset to STAKE after this many losses in a row
 
-DAILY_STOP_LOSS = 10         # stop the bot when today's P/L reaches -10 USD
-DAILY_TAKE_PROFIT = 0        # stop when today's P/L reaches +X USD (0 = disabled)
-BANKROLL = 50                # trade as if the account held only this much, e.g. 50
+DAILY_STOP_LOSS = setting("DAILY_STOP_LOSS", 10)  # (0 = off) stop the bot when today's P/L reaches -10 USD
+DAILY_TAKE_PROFIT = setting("DAILY_TAKE_PROFIT", 0)  # stop when today's P/L reaches +X USD (0 = disabled)
+BANKROLL = setting("BANKROLL", 50)  # trade as if the account held only this much, e.g. 50
                              # (0 = use the whole account balance). It carries over
                              # between runs; rename vera_trades.csv to start it over.
 
-DRY_RUN = True               # True = simulate trades on live prices, no real buys
+DRY_RUN = setting("DRY_RUN", True)  # True = simulate trades on live prices, no real buys
 DRY_RUN_START_BALANCE = 1000.0  # simulated balance when no token is set
 
 KEEPALIVE_SECONDS = 30      # send {"ping": 1} this often - Deriv drops idle connections
@@ -560,13 +576,13 @@ class TradingBot:
 
     def risk_allows(self, stake):
         self.check_day_rollover()
-        if self.daily_pnl <= -DAILY_STOP_LOSS:
+        if DAILY_STOP_LOSS and self.daily_pnl <= -DAILY_STOP_LOSS:
             self.stop(f"Daily stop loss hit ({self.daily_pnl:+.2f} {self.currency})")
             return False
         if DAILY_TAKE_PROFIT and self.daily_pnl >= DAILY_TAKE_PROFIT:
             self.stop(f"Daily take profit hit ({self.daily_pnl:+.2f} {self.currency})")
             return False
-        if self.daily_pnl - stake < -DAILY_STOP_LOSS:
+        if DAILY_STOP_LOSS and self.daily_pnl - stake < -DAILY_STOP_LOSS:
             self.stop(f"Next stake {stake:.2f} could exceed daily stop loss "
                       f"(P/L {self.daily_pnl:+.2f}, limit -{DAILY_STOP_LOSS})")
             return False
@@ -894,7 +910,8 @@ class TradingBot:
     async def run(self):
         log(f"Vera Bot | {self.mode} | {SYMBOL} | MA{MA_FAST}/MA{MA_SLOW} + RSI{RSI_PERIOD} on "
             f"{CANDLE_GRANULARITY}s candles | stake {STAKE} | martingale {MARTINGALE} | "
-            f"daily stop -{DAILY_STOP_LOSS} | today P/L {self.daily_pnl:+.2f}")
+            f"daily stop {f'-{DAILY_STOP_LOSS}' if DAILY_STOP_LOSS else 'off'} | "
+            f"bankroll {BANKROLL or 'off'} | today P/L {self.daily_pnl:+.2f}")
         if not DRY_RUN:
             log("!!! LIVE MODE - real contracts will be bought !!!")
         self.risk_allows(0)   # daily limit already hit earlier today?
