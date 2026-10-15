@@ -49,7 +49,7 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -77,6 +77,7 @@ Settings are at the top of `vera_bot.py`. The most common ones can also be set i
 | `MARTINGALE_MAX_STEPS` | `5` | Go back to `STAKE` after this many losses in a row |
 | `DAILY_STOP_LOSS` | `10` | Stop when today's P/L reaches -10 USD |
 | `DAILY_TAKE_PROFIT` | `0` | Stop when today's P/L reaches +X (0 = off) |
+| `BALANCE_TARGET` | `0` | Stop for good when the balance reaches this amount (e.g. `30`), so you can withdraw the profit. It doesn't restart until you raise or remove it. `0` = off |
 | `BANKROLL` | `50` | Trade as if the account held only this much USD. The bot stops when it can't cover the next stake. It carries over between runs; rename `vera_trades.csv` to start over. `0` = use the whole account balance |
 | `DRY_RUN` | `True` | Simulate trades on live prices without buying |
 

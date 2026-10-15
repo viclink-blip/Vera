@@ -115,6 +115,9 @@ MARTINGALE_MAX_STEPS = 5     # reset to STAKE after this many losses in a row
 
 DAILY_STOP_LOSS = setting("DAILY_STOP_LOSS", 10)  # (0 = off) stop the bot when today's P/L reaches -10 USD
 DAILY_TAKE_PROFIT = setting("DAILY_TAKE_PROFIT", 0)  # stop when today's P/L reaches +X USD (0 = disabled)
+BALANCE_TARGET = setting("BALANCE_TARGET", 0)  # stop for good when the balance reaches this
+                             # (e.g. 30), so you can withdraw. 0 = off. With BANKROLL the
+                             # bankroll balance counts, otherwise the account balance
 BANKROLL = setting("BANKROLL", 50)  # trade as if the account held only this much, e.g. 50
                              # (0 = use the whole account balance). It carries over
                              # between runs; rename vera_trades.csv to start it over.
@@ -725,6 +728,10 @@ class TradingBot:
         if DAILY_STOP_LOSS and self.daily_pnl <= -DAILY_STOP_LOSS:
             self.stop(f"Daily stop loss hit ({self.daily_pnl:+.2f} {self.currency})", daily=True)
             return False
+        if BALANCE_TARGET and self.sim_balance_set and self.balance >= BALANCE_TARGET:
+            self.stop(f"Balance target reached: {self.balance:.2f} >= {BALANCE_TARGET} {self.currency}. "
+                      "Withdraw your profit, then raise or remove VERA_BALANCE_TARGET to trade again")
+            return False
         if DAILY_TAKE_PROFIT and self.daily_pnl >= DAILY_TAKE_PROFIT:
             self.stop(f"Daily take profit hit ({self.daily_pnl:+.2f} {self.currency})", daily=True)
             return False
@@ -1096,6 +1103,8 @@ class TradingBot:
         pinger = asyncio.create_task(self.keepalive())
         try:
             await self.authorize(account)
+            if not self.risk_allows(0):   # balance target / daily limit already reached
+                return
             await self.load_active_symbols(show=SHOW_ACTIVE_SYMBOLS and not self.symbols_shown)
             self.symbols_shown = True
             await self.resolve_contract()
@@ -1121,7 +1130,9 @@ class TradingBot:
         log(f"Vera Bot | {self.mode} | {SYMBOL} | MA{MA_FAST}/MA{MA_SLOW} + RSI{RSI_PERIOD} on "
             f"{CANDLE_GRANULARITY}s candles | stake {STAKE} | martingale {MARTINGALE} | "
             f"daily stop {f'-{DAILY_STOP_LOSS}' if DAILY_STOP_LOSS else 'off'} | "
-            f"bankroll {BANKROLL or 'off'} | today P/L {self.daily_pnl:+.2f}")
+            f"take profit {f'+{DAILY_TAKE_PROFIT}' if DAILY_TAKE_PROFIT else 'off'} | "
+            f"target {BALANCE_TARGET or 'off'} | bankroll {BANKROLL or 'off'} | "
+            f"today P/L {self.daily_pnl:+.2f}")
         if not DRY_RUN:
             log("!!! LIVE MODE - real contracts will be bought !!!")
         log(f"Trades: crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} min without one | "
