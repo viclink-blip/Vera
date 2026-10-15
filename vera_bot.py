@@ -88,6 +88,13 @@ RSI_FILTER = True            # skip Rise when RSI >= RSI_OVERBOUGHT, Fall when R
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
+MAX_OPEN_TRADES = setting("MAX_OPEN_TRADES", 3)  # trades allowed open at the same time
+TREND_TRADE_MINUTES = setting("TREND_TRADE_MINUTES", 6)  # no trade for this many minutes ->
+                             # trade the current trend (MA7 above MA14 = Rise, below = Fall).
+                             # 6 gives at least 5 trades per 30 min. 0 = crossovers only
+WAIT_NEXT_DAY = setting("WAIT_NEXT_DAY", True)  # after a daily stop loss / take profit,
+                             # pause until 00:00 UTC and carry on (for 24h running)
+
 MARTINGALE = setting("MARTINGALE", False)  # after a loss, next stake = previous stake x MULTIPLIER
 MARTINGALE_MULTIPLIER = 2.1
 MARTINGALE_MAX_STEPS = 5     # reset to STAKE after this many losses in a row
@@ -326,8 +333,11 @@ class TradingBot:
         self._migrate_csv()
         self.daily_pnl = self._load_today_pnl()
 
-        self.trade_task = None
-        self.pending_contract = None           # live contract to resume after reconnect
+        self.trade_tasks = set()               # running trades
+        self.pending_contracts = {}            # contract_id -> info, resumed after reconnect
+        self.open_stake = 0.0                  # stake in trades that haven't settled yet
+        self.last_trade_time = time.time()
+        self.daily_limit_hit = False
         self.tick_listeners = []               # dry-run simulators waiting on ticks
         self.stopped = False
         self.stop_reason = ""
@@ -545,10 +555,15 @@ class TradingBot:
             direction = "RISE"
         elif f_prev >= s_prev and f_now < s_now:
             direction = "FALL"
+        if direction:
+            log(f">>> Signal {direction}: MA{MA_FAST} crossed {'above' if direction == 'RISE' else 'below'} "
+                f"MA{MA_SLOW} | RSI {rsi:.1f}")
+        elif TREND_TRADE_MINUTES and time.time() - self.last_trade_time >= TREND_TRADE_MINUTES * 60 - 5:
+            direction = "RISE" if f_now > s_now else "FALL"
+            log(f">>> Trend trade {direction}: no trade for {TREND_TRADE_MINUTES} min, MA{MA_FAST} "
+                f"{'above' if direction == 'RISE' else 'below'} MA{MA_SLOW} | RSI {rsi:.1f}")
         if not direction:
             return
-        log(f">>> Signal {direction}: MA{MA_FAST} crossed {'above' if direction == 'RISE' else 'below'} "
-            f"MA{MA_SLOW} | RSI {rsi:.1f}")
         if RSI_FILTER:
             if direction == "RISE" and rsi >= RSI_OVERBOUGHT:
                 log(f"RSI {rsi:.1f} >= {RSI_OVERBOUGHT} (overbought) - Rise skipped")
@@ -556,10 +571,23 @@ class TradingBot:
             if direction == "FALL" and rsi <= RSI_OVERSOLD:
                 log(f"RSI {rsi:.1f} <= {RSI_OVERSOLD} (oversold) - Fall skipped")
                 return
-        if self.trade_task and not self.trade_task.done():
-            log("Trade still open - signal skipped")
+        if len(self.trade_tasks) >= MAX_OPEN_TRADES:
+            log(f"{len(self.trade_tasks)} trades already open (MAX_OPEN_TRADES) - signal skipped")
             return
-        self.trade_task = asyncio.create_task(self.trade(direction, f_now, s_now, rsi))
+        self.last_trade_time = time.time()
+        self.start_task(self.trade(direction, f_now, s_now, rsi))
+
+    def start_task(self, coro):
+        task = asyncio.create_task(coro)
+        self.trade_tasks.add(task)
+        task.add_done_callback(self._task_done)
+
+    def _task_done(self, task):
+        self.trade_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            exc = task.exception()
+            if not isinstance(exc, (ConnectionError, asyncio.TimeoutError)):
+                log(f"Trade error: {exc!r}")
 
     def on_tick(self, epoch, quote):
         self.last_tick_epoch = epoch
@@ -577,14 +605,21 @@ class TradingBot:
     def risk_allows(self, stake):
         self.check_day_rollover()
         if DAILY_STOP_LOSS and self.daily_pnl <= -DAILY_STOP_LOSS:
-            self.stop(f"Daily stop loss hit ({self.daily_pnl:+.2f} {self.currency})")
+            self.stop(f"Daily stop loss hit ({self.daily_pnl:+.2f} {self.currency})", daily=True)
             return False
         if DAILY_TAKE_PROFIT and self.daily_pnl >= DAILY_TAKE_PROFIT:
-            self.stop(f"Daily take profit hit ({self.daily_pnl:+.2f} {self.currency})")
+            self.stop(f"Daily take profit hit ({self.daily_pnl:+.2f} {self.currency})", daily=True)
             return False
-        if DAILY_STOP_LOSS and self.daily_pnl - stake < -DAILY_STOP_LOSS:
+        at_risk = self.open_stake + stake
+        if DAILY_STOP_LOSS and self.daily_pnl - at_risk < -DAILY_STOP_LOSS:
+            if self.open_stake:   # wait for the open trades instead of stopping
+                log("Skipped: open trades + this stake could pass the daily stop loss")
+                return False
             self.stop(f"Next stake {stake:.2f} could exceed daily stop loss "
-                      f"(P/L {self.daily_pnl:+.2f}, limit -{DAILY_STOP_LOSS})")
+                      f"(P/L {self.daily_pnl:+.2f}, limit -{DAILY_STOP_LOSS})", daily=True)
+            return False
+        if self.open_stake and at_risk > self.balance:
+            log(f"Skipped: balance {self.balance:.2f} is tied up in open trades")
             return False
         if stake > self.balance:
             what = "Bankroll" if BANKROLL else "Balance"
@@ -592,8 +627,9 @@ class TradingBot:
             return False
         return True
 
-    def stop(self, reason):
+    def stop(self, reason, daily=False):
         if not self.stopped:
+            self.daily_limit_hit = daily
             self.stopped = True
             self.stop_reason = reason
             self.stop_event.set()
@@ -644,6 +680,13 @@ class TradingBot:
         stake = round(self.stake, 2)
         if self.stopped or not self.risk_allows(stake):
             return
+        self.open_stake = round(self.open_stake + stake, 2)
+        try:
+            await self._trade(direction, stake, ma_fast, ma_slow, rsi)
+        finally:
+            self.open_stake = round(self.open_stake - stake, 2)
+
+    async def _trade(self, direction, stake, ma_fast, ma_slow, rsi):
         req = self.proposal_request(direction, stake)
         contract_type = req["contract_type"]
         try:
@@ -686,15 +729,15 @@ class TradingBot:
         contract_id = buy["contract_id"]
         log(f"BOUGHT {contract_type} #{contract_id} for {float(buy['buy_price']):.2f} "
             f"(balance {float(buy['balance_after']):.2f})")
-        self.pending_contract = dict(direction=direction, contract_type=contract_type, stake=stake,
-                                     ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi,
-                                     contract_id=contract_id, kind=self.kind,
-                                     sell_at=time.time() + MULT_HOLD_SECONDS)
-        await self.watch_contract()
+        info = dict(direction=direction, contract_type=contract_type, stake=stake,
+                    ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi,
+                    contract_id=contract_id, kind=self.kind,
+                    sell_at=time.time() + MULT_HOLD_SECONDS)
+        self.pending_contracts[contract_id] = info
+        await self.watch_contract(info)
 
-    async def watch_contract(self):
+    async def watch_contract(self, info):
         """Follow a live contract until it is sold/expired, then record it."""
-        info = self.pending_contract
         rid, q = await self.api.subscribe({"proposal_open_contract": 1,
                                            "contract_id": info["contract_id"]})
         sub_id = None
@@ -725,7 +768,7 @@ class TradingBot:
             if sub_id and self.api.ws:
                 asyncio.create_task(self.api.forget(sub_id))
 
-        self.pending_contract = None
+        self.pending_contracts.pop(info["contract_id"], None)
         profit = round(float(poc["profit"]), 2)
         try:
             if BANKROLL:
@@ -888,23 +931,22 @@ class TradingBot:
             await self.load_active_symbols(show=SHOW_ACTIVE_SYMBOLS and not self.symbols_shown)
             self.symbols_shown = True
             await self.resolve_contract()
-            if self.pending_contract:
-                log(f"Resuming open contract #{self.pending_contract['contract_id']}")
-                self.trade_task = asyncio.create_task(self.watch_contract())
+            for info in list(self.pending_contracts.values()):
+                log(f"Resuming open contract #{info['contract_id']}")
+                self.start_task(self.watch_contract(info))
             await self.stream_candles()
-            if self.trade_task and not self.trade_task.done():
+            if self.trade_tasks:
                 if DRY_RUN:
-                    self.trade_task.cancel()     # simulated trade, nothing to settle
+                    for task in list(self.trade_tasks):
+                        task.cancel()            # simulated trades, nothing to settle
                 else:
-                    log("Waiting for open contract to settle (Ctrl+C again to quit now)...")
-                    try:
-                        await self.trade_task
-                    except asyncio.CancelledError:
-                        log("Quit without waiting - the contract still settles on Deriv")
+                    log(f"Waiting for {len(self.trade_tasks)} open contract(s) to settle "
+                        "(Ctrl+C again to quit now)...")
+                    await asyncio.gather(*self.trade_tasks, return_exceptions=True)
         finally:
             pinger.cancel()
-            if self.trade_task and not self.trade_task.done():
-                self.trade_task.cancel()
+            for task in list(self.trade_tasks):
+                task.cancel()
             await self.api.close()
 
     async def run(self):
@@ -914,7 +956,32 @@ class TradingBot:
             f"bankroll {BANKROLL or 'off'} | today P/L {self.daily_pnl:+.2f}")
         if not DRY_RUN:
             log("!!! LIVE MODE - real contracts will be bought !!!")
-        self.risk_allows(0)   # daily limit already hit earlier today?
+        log(f"Trades: crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} min without one | "
+            f"max {MAX_OPEN_TRADES} open | wait for next day {WAIT_NEXT_DAY}")
+        while True:
+            self.risk_allows(0)   # daily limit already hit today?
+            await self.run_until_stopped()
+            if not (WAIT_NEXT_DAY and self.daily_limit_hit):
+                break
+            now = now_utc()
+            midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp() + 86400
+            wait = midnight - now.timestamp() + 5
+            log(f"Daily limit reached - pausing until 00:00 UTC ({wait / 3600:.1f} h). Ctrl+C to quit.")
+            self.stop_event.clear()
+            try:
+                await asyncio.wait_for(self.stop_event.wait(), wait)
+            except asyncio.TimeoutError:
+                pass
+            if not self.daily_limit_hit:   # Ctrl+C while waiting
+                break
+            self.stopped, self.stop_reason, self.daily_limit_hit = False, "", False
+            self.stop_event.clear()
+            self.check_day_rollover()
+            log("New trading day - Vera Bot resumes")
+        log(f"Vera Bot stopped. {self.stop_reason} | today P/L {self.daily_pnl:+.2f} | "
+            f"trades logged in {CSV_FILE.name}")
+
+    async def run_until_stopped(self):
         delay = 2
         while not self.stopped:
             started = time.time()
@@ -939,8 +1006,6 @@ class TradingBot:
             except asyncio.TimeoutError:
                 pass
             delay = min(delay * 2, 60)
-        log(f"Vera Bot stopped. {self.stop_reason} | today P/L {self.daily_pnl:+.2f} | "
-            f"trades logged in {CSV_FILE.name}")
 
 
 # Fallback names/groups from the symbol code, for API versions that don't send them
@@ -1049,9 +1114,12 @@ async def main():
     loop = asyncio.get_running_loop()
 
     def on_signal():
-        if bot.stopped and bot.trade_task and not bot.trade_task.done():
-            bot.trade_task.cancel()          # second Ctrl+C: don't wait for the contract
+        if bot.stopped:
+            for task in list(bot.trade_tasks):
+                task.cancel()                # second Ctrl+C: don't wait for open contracts
+        bot.daily_limit_hit = False          # Ctrl+C always quits, also while waiting for tomorrow
         bot.stop("stopped by user (Ctrl+C)")
+        bot.stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, on_signal)

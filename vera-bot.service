@@ -1,0 +1,22 @@
+# Runs Vera Bot in the background, 24/7, and restarts it if it crashes or the
+# laptop reboots. Install (as your normal user, not root):
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/vera-bot/vera-bot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vera-bot
+#   sudo loginctl enable-linger $USER     # keep running when you log out / after reboot
+# Watch:  journalctl --user -u vera-bot -f
+# Stop:   systemctl --user stop vera-bot
+[Unit]
+Description=Vera Bot - Deriv trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=%h/vera-bot
+ExecStart=%h/vera-bot/.venv/bin/python -u %h/vera-bot/vera_bot.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=default.target

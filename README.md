@@ -49,7 +49,7 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT` and `VERA_MARTINGALE`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES` and `VERA_WAIT_NEXT_DAY`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -67,6 +67,9 @@ Settings are at the top of `vera_bot.py`. The most common ones can also be set i
 | `RSI_PERIOD` / `RSI_FILTER` | `14` / `True` | RSI length; turn the filter on or off |
 | `RSI_OVERBOUGHT` / `RSI_OVERSOLD` | `70` / `30` | RSI filter levels |
 | `CANDLE_GRANULARITY` | `60` | Candle size in seconds |
+| `MAX_OPEN_TRADES` | `3` | How many trades can be open at the same time; a new signal is only skipped when this many are open |
+| `TREND_TRADE_MINUTES` | `6` | If no trade happened for this many minutes, trade the current trend (MA7 above MA14 = Rise, below = Fall, RSI filter still applies). `6` gives at least 5 trades per 30 minutes; `0` = crossovers only |
+| `WAIT_NEXT_DAY` | `True` | After the daily stop loss / take profit, pause until 00:00 UTC and carry on instead of exiting |
 | `MARTINGALE` | `False` | After a loss, multiply the next stake by `MARTINGALE_MULTIPLIER` (2.1) |
 | `MARTINGALE_MAX_STEPS` | `5` | Go back to `STAKE` after this many losses in a row |
 | `DAILY_STOP_LOSS` | `10` | Stop when today's P/L reaches -10 USD |
@@ -98,6 +101,23 @@ Run it in the background on a server:
 nohup python3 vera_bot.py >> bot.log 2>&1 &
 tail -f bot.log
 ```
+
+## Run it 24 hours a day
+
+`vera-bot.service` runs the bot in the background with systemd. It restarts the bot if it crashes and starts it again after a reboot:
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/vera-bot/vera-bot.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now vera-bot
+sudo loginctl enable-linger $USER      # keep it running after logout / reboot
+journalctl --user -u vera-bot -f       # watch the log (Ctrl+C stops watching, not the bot)
+systemctl --user stop vera-bot         # stop the bot
+systemctl --user restart vera-bot      # restart it after git pull or .env changes
+```
+
+The computer must stay on, awake and online. On a laptop, disable sleep and lid-close suspend, or run the bot on a small Linux VPS.
 
 ## How it works
 
