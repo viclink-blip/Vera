@@ -71,6 +71,7 @@ Settings are at the top of `vera_bot.py`:
 | `MARTINGALE_MAX_STEPS` | `5` | Go back to `STAKE` after this many losses in a row |
 | `DAILY_STOP_LOSS` | `10` | Stop when today's P/L reaches -10 USD |
 | `DAILY_TAKE_PROFIT` | `0` | Stop when today's P/L reaches +X (0 = off) |
+| `BANKROLL` | `50` | Trade as if the account held only this much USD. The bot stops when it can't cover the next stake. It carries over between runs; rename `vera_trades.csv` to start over. `0` = use the whole account balance |
 | `DRY_RUN` | `True` | Simulate trades on live prices without buying |
 
 ## 4. Run

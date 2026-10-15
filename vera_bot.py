@@ -78,6 +78,9 @@ MARTINGALE_MAX_STEPS = 5     # reset to STAKE after this many losses in a row
 
 DAILY_STOP_LOSS = 10         # stop the bot when today's P/L reaches -10 USD
 DAILY_TAKE_PROFIT = 0        # stop when today's P/L reaches +X USD (0 = disabled)
+BANKROLL = 50                # trade as if the account held only this much, e.g. 50
+                             # (0 = use the whole account balance). It carries over
+                             # between runs; rename vera_trades.csv to start it over.
 
 DRY_RUN = True               # True = simulate trades on live prices, no real buys
 DRY_RUN_START_BALANCE = 1000.0  # simulated balance when no token is set
@@ -332,6 +335,30 @@ class TradingBot:
         if header != CSV_COLUMNS:
             pd.read_csv(CSV_FILE).reindex(columns=CSV_COLUMNS).to_csv(CSV_FILE, index=False)
 
+    def _bankroll_balance(self):
+        """BANKROLL plus the P/L of every trade logged for this account and mode."""
+        total = 0.0
+        if CSV_FILE.exists():
+            try:
+                df = pd.read_csv(CSV_FILE)
+                mine = (df["mode"] == self.mode) & (df["account"].astype(str) == str(self.account))
+                total = float(pd.to_numeric(df.loc[mine, "profit"], errors="coerce").sum())
+            except Exception as e:  # noqa: BLE001
+                log(f"Could not read {CSV_FILE.name} for the bankroll ({e})")
+        return round(BANKROLL + total, 2)
+
+    def set_balance(self, account_balance):
+        """Set the balance the bot trades with, once per run for dry run / bankroll."""
+        if self.sim_balance_set and (DRY_RUN or BANKROLL):
+            return
+        self.sim_balance_set = True
+        if BANKROLL:
+            self.balance = self._bankroll_balance()
+            log(f"Bankroll mode: trading with {self.balance:.2f} of {BANKROLL:.2f} {self.currency} "
+                f"(account holds {account_balance:.2f})")
+        else:
+            self.balance = account_balance
+
     def _load_today_pnl(self):
         """Resume today's P/L from the CSV so a restart doesn't reset the stop loss."""
         if not CSV_FILE.exists():
@@ -358,11 +385,9 @@ class TradingBot:
                 self.currency = bal.get("currency") or self.currency
             except (DerivAPIError, KeyError, TypeError, ValueError):
                 balance = float(account.get("balance") or 0)
-            if not DRY_RUN or not self.sim_balance_set:
-                self.balance = balance   # dry run: simulate from the real balance once
-                self.sim_balance_set = True
             kind = "DEMO" if self.is_virtual else "REAL"
             log(f"Logged in {self.account} ({kind}) balance {balance:.2f} {self.currency}")
+            self.set_balance(balance)
             return
         if not self.token:
             raise SystemExit("DERIV_TOKEN missing in .env")
@@ -370,10 +395,9 @@ class TradingBot:
         self.account = auth["loginid"]
         self.is_virtual = bool(auth.get("is_virtual"))
         self.currency = auth.get("currency") or CURRENCY
-        if not DRY_RUN:
-            self.balance = float(auth["balance"])
         kind = "DEMO" if self.is_virtual else "REAL"
         log(f"Authorized {self.account} ({kind}) balance {float(auth['balance']):.2f} {self.currency}")
+        self.set_balance(float(auth["balance"]))
 
     async def load_active_symbols(self, show):
         """Fetch every active Deriv symbol, optionally print them, and check SYMBOL."""
@@ -547,7 +571,8 @@ class TradingBot:
                       f"(P/L {self.daily_pnl:+.2f}, limit -{DAILY_STOP_LOSS})")
             return False
         if stake > self.balance:
-            self.stop(f"Insufficient balance {self.balance:.2f} for stake {stake:.2f}")
+            what = "Bankroll" if BANKROLL else "Balance"
+            self.stop(f"{what} {self.balance:.2f} too low for stake {stake:.2f}")
             return False
         return True
 
@@ -687,6 +712,8 @@ class TradingBot:
         self.pending_contract = None
         profit = round(float(poc["profit"]), 2)
         try:
+            if BANKROLL:
+                raise ValueError("bankroll mode tracks its own balance")
             self.balance = float((await self.api.request({"balance": 1}))["balance"]["balance"])
         except Exception:  # noqa: BLE001
             self.balance = round(self.balance + profit, 2)
