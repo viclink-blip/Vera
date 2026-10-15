@@ -411,11 +411,14 @@ class TradingBot:
             log(f"contracts_for failed ({e}); using Rise/Fall {DURATION}{DURATION_UNIT}")
             return
         available = resp["contracts_for"]["available"]
+        calls = [c for c in available if c.get("contract_type") == "CALL"]
+        # Rise/Fall = CALL without barriers. Field formats differ between API
+        # versions (barriers 0 / "0" / missing), so only rule out clear mismatches.
         offers = [
-            c for c in available
-            if c["contract_type"] == "CALL" and c.get("barriers") == 0
-            and c["expiry_type"] in ("tick", "intraday", "daily")
-        ]
+            c for c in calls
+            if str(c.get("barriers", 0)) in ("0", "", "None")
+            and c.get("expiry_type") != "no_expiry"
+        ] or calls
         mult_offers = [c for c in available if c["contract_type"] == "MULTUP"]
         types = sorted({c["contract_type"] for c in available})
         log(f"Contract types for {SYMBOL}: {', '.join(types)}")
@@ -435,10 +438,20 @@ class TradingBot:
             raise SystemExit(f"Rise/Fall is not offered for {SYMBOL} (types: {', '.join(types)})")
         self.kind = "risefall"
 
+        ranges = []
+        for c in offers:
+            try:
+                ranges.append((parse_duration(c["min_contract_duration"]),
+                               parse_duration(c["max_contract_duration"])))
+            except (KeyError, ValueError, TypeError, IndexError):
+                pass
+        if not ranges:   # duration format unknown - let the proposal validate it
+            log(f"Contract: Rise/Fall {DURATION}{DURATION_UNIT} (durations not listed: "
+                f"{json.dumps(offers[0])[:300]})")
+            return
+
         def allowed(value, unit):
-            for c in offers:
-                lo_v, lo_u = parse_duration(c["min_contract_duration"])
-                hi_v, hi_u = parse_duration(c["max_contract_duration"])
+            for (lo_v, lo_u), (hi_v, hi_u) in ranges:
                 if unit == "t" and lo_u == "t" and lo_v <= value <= hi_v:
                     return True
                 if unit != "t" and lo_u != "t":
@@ -450,7 +463,7 @@ class TradingBot:
         if allowed(DURATION, DURATION_UNIT):
             log(f"Contract: Rise/Fall {DURATION}{DURATION_UNIT}")
             return
-        mins = [parse_duration(c["min_contract_duration"]) for c in offers]
+        mins = [lo for lo, _ in ranges]
         if not AUTO_ADJUST_DURATION:
             raise SystemExit(f"{DURATION}{DURATION_UNIT} not allowed for {SYMBOL}. "
                              f"Minimums offered: {[f'{v}{u}' for v, u in mins]}")
