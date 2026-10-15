@@ -372,8 +372,8 @@ class TradingBot:
         """Fetch every active Deriv symbol, optionally print them, and check SYMBOL."""
         resp = await self.api.request({"active_symbols": "brief"})
         symbols = resp["active_symbols"]
-        for sym in symbols:  # newer API versions call it underlying_symbol
-            sym["symbol"] = sym.get("symbol") or sym.get("underlying_symbol", "")
+        for sym in symbols:
+            normalize_symbol(sym)
         if show:
             print_symbols(symbols)
         by_code = {sym["symbol"]: sym for sym in symbols}
@@ -860,6 +860,61 @@ class TradingBot:
             f"trades logged in {CSV_FILE.name}")
 
 
+# Fallback names/groups from the symbol code, for API versions that don't send them
+SYMBOL_GROUPS = [
+    ("1HZ", "Derived", "Volatility (1s) Indices"), ("R_", "Derived", "Volatility Indices"),
+    ("BOOM", "Derived", "Crash/Boom Indices"), ("CRASH", "Derived", "Crash/Boom Indices"),
+    ("JD", "Derived", "Jump Indices"), ("stpRNG", "Derived", "Step Indices"),
+    ("RB", "Derived", "Range Break Indices"), ("RDB", "Derived", "Daily Reset Indices"),
+    ("WLD", "Derived", "Basket Indices"), ("OTC_", "Stock Indices", "Stock Indices"),
+    ("cry", "Cryptocurrencies", "Crypto"),
+    ("frxXA", "Commodities", "Metals"), ("frxXP", "Commodities", "Metals"),
+    ("frx", "Forex", "Forex Pairs"),
+]
+
+
+def guess_name(code):
+    if code.startswith("frx") or code.startswith("cry"):
+        return f"{code[3:6]}/{code[6:]}"
+    if code.startswith("1HZ"):
+        return f"Volatility {code[3:-1]} (1s) Index"
+    if code.startswith("R_"):
+        return f"Volatility {code[2:]} Index"
+    for prefix, word in (("BOOM", "Boom"), ("CRASH", "Crash"), ("JD", "Jump")):
+        if code.startswith(prefix):
+            return f"{word} {code[len(prefix):]} Index"
+    if code.startswith("RB"):
+        return f"Range Break {code[2:]} Index"
+    if code.startswith("stpRNG"):
+        return f"Step Index {code[6:] or 1}"
+    if code.startswith("WLD"):
+        return f"{code[3:]} Basket"
+    if code.startswith("OTC_"):
+        return f"{code[4:]} stock index"
+    return {"RDBULL": "Bull Market Index", "RDBEAR": "Bear Market Index"}.get(code, "")
+
+
+def normalize_symbol(sym):
+    """Fill symbol / display_name / market / submarket whatever the API version calls them."""
+    def first(*keys):
+        for k in keys:
+            if sym.get(k):
+                return str(sym[k])
+        return ""
+    code = first("symbol", "underlying_symbol")
+    sym["symbol"] = code
+    sym["display_name"] = first("display_name", "underlying_symbol_name", "symbol_display_name",
+                                "name") or guess_name(code)
+    market = first("market_display_name", "market_name")
+    submarket = first("submarket_display_name", "submarket_name")
+    if not (market and submarket):
+        group = next(((m, sm) for prefix, m, sm in SYMBOL_GROUPS if code.startswith(prefix)),
+                     (first("market") or "Other", first("submarket") or "Other"))
+        market, submarket = market or group[0], submarket or group[1]
+    sym["market_display_name"], sym["submarket_display_name"] = market, submarket
+    return sym
+
+
 def print_symbols(symbols):
     """Print active symbols grouped by market."""
     print(f"\n===== {len(symbols)} active Deriv symbols =====", flush=True)
@@ -887,7 +942,7 @@ async def list_symbols():
         resp = await api.request({"active_symbols": "brief"})
         symbols = resp["active_symbols"]
         for sym in symbols:
-            sym["symbol"] = sym.get("symbol") or sym.get("underlying_symbol", "")
+            normalize_symbol(sym)
         print_symbols(symbols)
     finally:
         await api.close()
