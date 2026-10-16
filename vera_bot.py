@@ -61,9 +61,13 @@ def setting(name, default):
 # ============================================================================
 ACCOUNT_TYPE = setting("ACCOUNT_TYPE", "demo")  # "demo" or "real" - which of your Deriv accounts to use
 
-SYMBOL = setting("SYMBOL", "R_75")  # any Deriv symbol, e.g. R_75, R_100, 1HZ100V, BOOM1000,
+SYMBOL = setting("SYMBOL", "R_75")  # one or more Deriv symbols, comma separated:
+                             # "R_75" or "R_75,R_100" (each market is watched on its own;
+                             # balance, daily P/L and limits are shared). Examples:
+                             # R_75, R_100, 1HZ100V, BOOM1000,
                              # CRASH500, JD25, frxEURUSD, frxXAUUSD, cryBTCUSD ...
                              # run `python3 vera_bot.py --symbols` to see them all
+SYMBOLS = [x.strip() for x in str(SYMBOL).split(",") if x.strip()]
 SHOW_ACTIVE_SYMBOLS = setting("SHOW_ACTIVE_SYMBOLS", True)  # print every active symbol at startup
 
 CONTRACT = setting("CONTRACT", "RISEFALL")  # what to trade:
@@ -420,13 +424,42 @@ async def get_session(token):
     return url, account
 
 
+class Shared:
+    """Money and limits shared by every market the bot watches."""
+
+    def __init__(self):
+        self.balance = DRY_RUN_START_BALANCE
+        self.sim_balance_set = False
+        self.symbols_shown = False
+        self.stake = float(STAKE)
+        self.loss_streak = 0
+        self.trading_day = now_local().date()
+        self.daily_pnl = 0.0
+        self.open_stake = 0.0                  # stake in trades that haven't settled yet
+        self.daily_limit_hit = False
+        self.stopped = False
+        self.stop_reason = ""
+        self.stop_event = asyncio.Event()
+        self.bots = []
+
+
+SHARED_FIELDS = ("balance", "sim_balance_set", "symbols_shown", "stake", "loss_streak",
+                 "trading_day", "daily_pnl", "open_stake", "daily_limit_hit", "stopped",
+                 "stop_reason", "stop_event")
+
+
 class TradingBot:
-    def __init__(self, token):
+    """Watches one market; money and limits live in the Shared object."""
+
+    def __init__(self, token, symbol=None, shared=None):
+        self.symbol = symbol or SYMBOLS[0]
+        self.shared = shared or Shared()
+        self.shared.bots.append(self)
+        self.first = len(self.shared.bots) == 1
         self.token = token
         self.api = None
         self.account = "none"
         self.is_virtual = None
-        self.balance = DRY_RUN_START_BALANCE
         self.currency = CURRENCY
         self.duration = DURATION
         self.duration_unit = DURATION_UNIT
@@ -436,8 +469,6 @@ class TradingBot:
         self.auto_risefall = True
         self.decimals = None                    # price decimals, for last digits
         self.multiplier = MULTIPLIER
-        self.symbols_shown = False
-        self.sim_balance_set = False
         self.symbol_key = "underlying_symbol"   # new API name; falls back to "symbol"
 
         self.closes = pd.Series(dtype=float)   # closed candles, index = open_time
@@ -445,21 +476,14 @@ class TradingBot:
         self.current_close = None
         self.last_tick_epoch = None
 
-        self.stake = float(STAKE)
-        self.loss_streak = 0
-        self.trading_day = now_local().date()
-        self._migrate_csv()
-        self.daily_pnl = self._load_today_pnl()
+        if self.first:
+            self._migrate_csv()
+            self.daily_pnl = self._load_today_pnl()
 
-        self.trade_tasks = set()               # running trades
+        self.trade_tasks = set()               # running trades on this market
         self.pending_contracts = {}            # contract_id -> info, resumed after reconnect
-        self.open_stake = 0.0                  # stake in trades that haven't settled yet
         self.last_trade_time = time.time()
-        self.daily_limit_hit = False
         self.tick_listeners = []               # dry-run simulators waiting on ticks
-        self.stopped = False
-        self.stop_reason = ""
-        self.stop_event = asyncio.Event()
 
     # ------------------------------------------------------------------ setup
     @property
@@ -544,7 +568,7 @@ class TradingBot:
         self.set_balance(float(auth["balance"]))
 
     async def load_active_symbols(self, show):
-        """Fetch every active Deriv symbol, optionally print them, and check SYMBOL."""
+        """Fetch every active Deriv symbol, optionally print them, and check self.symbol."""
         resp = await self.api.request({"active_symbols": "brief"})
         symbols = resp["active_symbols"]
         for sym in symbols:
@@ -552,23 +576,23 @@ class TradingBot:
         if show:
             print_symbols(symbols)
         by_code = {sym["symbol"]: sym for sym in symbols}
-        info = by_code.get(SYMBOL)
+        info = by_code.get(self.symbol)
         if info is None:
             hits = [c for c, sym in by_code.items()
-                    if SYMBOL.lower() in (c.lower(), sym.get("display_name", "").lower())]
+                    if self.symbol.lower() in (c.lower(), sym.get("display_name", "").lower())]
             hint = f" Did you mean {hits[0]}?" if hits else " Run with --symbols to list them."
-            raise SystemExit(f"Symbol {SYMBOL!r} is not an active Deriv symbol.{hint}")
+            raise SystemExit(f"Symbol {self.symbol!r} is not an active Deriv symbol.{hint}")
         self.decimals = pip_decimals(info) if pip_decimals(info) is not None else self.decimals
         status = "OPEN" if info.get("exchange_is_open") else "CLOSED"
         if info.get("is_trading_suspended"):
             status = "SUSPENDED"
-        log(f"Symbol {SYMBOL} = {info.get('display_name')} "
+        log(f"Symbol {self.symbol} = {info.get('display_name')} "
             f"({info.get('market_display_name')} / {info.get('submarket_display_name')}) - market {status}")
         if status != "OPEN":
             log("Market not open now - trades will be rejected until it opens")
 
     async def resolve_contract(self):
-        """Check CONTRACT against what SYMBOL offers and set duration / multiplier."""
+        """Check CONTRACT against what self.symbol offers and set duration / multiplier."""
         contract = str(CONTRACT).upper()
         if contract not in ("RISEFALL", "MULTIPLIER", "AUTO") + DIGIT_TYPES:
             raise SystemExit(f"Unknown CONTRACT {CONTRACT!r}. Use RISEFALL, MULTIPLIER, AUTO or "
@@ -586,7 +610,7 @@ class TradingBot:
                 log(f"Contract: Rise/Fall {self.duration_label(self.contract)}")
         if contract in DIGIT_TYPES:
             if self.available_types and contract not in self.available_types:
-                raise SystemExit(f"{contract} is not offered for {SYMBOL}")
+                raise SystemExit(f"{contract} is not offered for {self.symbol}")
             self.contract, self.kind = contract, "digit"
             log(f"Contract: {digit_label(contract, DIGIT_BARRIER)} over {DIGIT_TICKS} ticks "
                 f"(win chance {digit_win_chance(contract, DIGIT_BARRIER):.0%})")
@@ -597,14 +621,14 @@ class TradingBot:
                 "smallest Deriv edge")
 
     async def _resolve_direction_contract(self, mode):
-        """Pick Rise/Fall or Multipliers for SYMBOL and check duration / multiplier."""
+        """Pick Rise/Fall or Multipliers for self.symbol and check duration / multiplier."""
         try:
             try:
-                resp = await self.api.request({"contracts_for": SYMBOL, "currency": self.currency})
+                resp = await self.api.request({"contracts_for": self.symbol, "currency": self.currency})
             except DerivAPIError as e:
                 if e.code != "InputValidationFailed":
                     raise
-                resp = await self.api.request({"contracts_for": SYMBOL})   # new API: no currency
+                resp = await self.api.request({"contracts_for": self.symbol})   # new API: no currency
         except DerivAPIError as e:
             log(f"contracts_for failed ({e}); using Rise/Fall {DURATION}{DURATION_UNIT}")
             return
@@ -620,20 +644,20 @@ class TradingBot:
         ] or calls
         mult_offers = [c for c in available if c["contract_type"] == "MULTUP"]
         types = sorted({c["contract_type"] for c in available})
-        log(f"Contract types for {SYMBOL}: {', '.join(types)}")
+        log(f"Contract types for {self.symbol}: {', '.join(types)}")
 
         if mode == "multiplier" or (mode == "auto" and not offers):
             if not mult_offers:
-                raise SystemExit(f"Neither Rise/Fall nor Multipliers are offered for {SYMBOL}")
+                raise SystemExit(f"Neither Rise/Fall nor Multipliers are offered for {self.symbol}")
             self.kind = "multiplier"
             allowed_mults = sorted({int(m) for c in mult_offers for m in c.get("multiplier_range", [])})
             if allowed_mults and MULTIPLIER not in allowed_mults:
                 self.multiplier = min(allowed_mults, key=lambda m: (abs(m - MULTIPLIER), m))
-                log(f"Multiplier x{MULTIPLIER} not offered for {SYMBOL}; using x{self.multiplier} "
+                log(f"Multiplier x{MULTIPLIER} not offered for {self.symbol}; using x{self.multiplier} "
                     f"(allowed {allowed_mults})")
             return
         if not offers:
-            raise SystemExit(f"Rise/Fall is not offered for {SYMBOL} (types: {', '.join(types)})")
+            raise SystemExit(f"Rise/Fall is not offered for {self.symbol} (types: {', '.join(types)})")
         self.kind = "risefall"
 
         ranges = []
@@ -662,13 +686,13 @@ class TradingBot:
             return
         mins = [lo for lo, _ in ranges]
         if not AUTO_ADJUST_DURATION:
-            raise SystemExit(f"{DURATION}{DURATION_UNIT} not allowed for {SYMBOL}. "
+            raise SystemExit(f"{DURATION}{DURATION_UNIT} not allowed for {self.symbol}. "
                              f"Minimums offered: {[f'{v}{u}' for v, u in mins]}")
         # prefer ticks, else shortest time based duration
         ticks = [m for m in mins if m[1] == "t"]
         best = min(ticks) if ticks else min(mins, key=lambda m: duration_to_seconds(*m))
         self.duration, self.duration_unit = best
-        log(f"{DURATION}{DURATION_UNIT} not offered for {SYMBOL}; using {best[0]}{best[1]}")
+        log(f"{DURATION}{DURATION_UNIT} not offered for {self.symbol}; using {best[0]}{best[1]}")
 
     # ------------------------------------------------------------- strategy
     def _ma(self):
@@ -686,7 +710,7 @@ class TradingBot:
         fast, slow, rsi_s = compute_indicators(self.closes)
         f_prev, s_prev, f_now, s_now = fast.iloc[-2], slow.iloc[-2], fast.iloc[-1], slow.iloc[-1]
         rsi = rsi_s.iloc[-1]
-        log(f"{SYMBOL} candle close {close} | MA{MA_FAST}={f_now:.5f} MA{MA_SLOW}={s_now:.5f} "
+        log(f"{self.symbol} candle close {close} | MA{MA_FAST}={f_now:.5f} MA{MA_SLOW}={s_now:.5f} "
             f"RSI{RSI_PERIOD}={rsi:.1f}")
 
         direction, why = decide(f_prev, s_prev, f_now, s_now, (time.time() - self.last_trade_time) / 60)
@@ -703,8 +727,9 @@ class TradingBot:
             limit = f">= {RSI_OVERBOUGHT} (overbought)" if direction == "RISE" else f"<= {RSI_OVERSOLD} (oversold)"
             log(f"RSI {rsi:.1f} {limit} - {direction.title()} skipped")
             return
-        if len(self.trade_tasks) >= MAX_OPEN_TRADES:
-            log(f"{len(self.trade_tasks)} trades already open (MAX_OPEN_TRADES) - signal skipped")
+        open_now = sum(len(b.trade_tasks) for b in self.shared.bots)
+        if open_now >= MAX_OPEN_TRADES:
+            log(f"{open_now} trades already open (MAX_OPEN_TRADES) - {self.symbol} signal skipped")
             return
         self.last_trade_time = time.time()
         self.start_task(self.trade(direction, f_now, s_now, rsi, rsi_ok))
@@ -789,7 +814,7 @@ class TradingBot:
     def proposal_request(self, direction, stake, contract, barrier=None):
         """Build the proposal for one contract (RISEFALL, MULTIPLIER or a DIGIT type)."""
         req = {"proposal": 1, "amount": stake, "basis": "stake",
-               "currency": self.currency, self.symbol_key: SYMBOL}
+               "currency": self.currency, self.symbol_key: self.symbol}
         if contract in DIGIT_TYPES:
             req["contract_type"] = contract
             req["duration"] = DIGIT_TICKS
@@ -883,7 +908,7 @@ class TradingBot:
         extra = (f"x{self.multiplier} commission {float(proposal.get('commission') or 0):.2f}"
                  if contract == "MULTIPLIER" else f"payout {payout:.2f}")
         log(f"Proposal {contract_type}{' ' + str(barrier) if needs_barrier(contract) else ''} "
-            f"{SYMBOL} stake {stake:.2f} {extra} spot {proposal.get('spot')}")
+            f"{self.symbol} stake {stake:.2f} {extra} spot {proposal.get('spot')}")
 
         if DRY_RUN:
             if contract == "MULTIPLIER":
@@ -904,7 +929,7 @@ class TradingBot:
             log(f"Buy failed: {e}")
             return
         contract_id = buy["contract_id"]
-        log(f"BOUGHT {contract_type} #{contract_id} for {float(buy['buy_price']):.2f} "
+        log(f"BOUGHT {self.symbol} {contract_type} #{contract_id} for {float(buy['buy_price']):.2f} "
             f"(balance {float(buy['balance_after']):.2f})")
         info = dict(direction=label, contract_type=contract_type, stake=stake,
                     ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi, duration=duration,
@@ -1039,11 +1064,11 @@ class TradingBot:
         self.check_day_rollover()
         self.daily_pnl = round(self.daily_pnl + profit, 2)
         result = "WIN" if won else "LOSS"
-        log(f"{'✅' if won else '❌'} {result} {direction} | entry {entry} exit {exit_spot} | "
+        log(f"{'✅' if won else '❌'} {result} {self.symbol} {direction} | entry {entry} exit {exit_spot} | "
             f"P/L {profit:+.2f} | day {self.daily_pnl:+.2f} | balance {self.balance:.2f} {self.currency}")
         row = {
             "time": now_local().isoformat(timespec="seconds"), "mode": self.mode,
-            "account": self.account, "symbol": SYMBOL, "direction": direction,
+            "account": self.account, "symbol": self.symbol, "direction": direction,
             "contract_type": contract_type, "duration": duration or self.duration_label(self.contract),
             "stake": f"{stake:.2f}", "ma_fast": f"{ma_fast:.5f}", "ma_slow": f"{ma_slow:.5f}",
             "rsi": f"{rsi:.1f}",
@@ -1063,7 +1088,7 @@ class TradingBot:
     # --------------------------------------------------------------- main loop
     async def stream_candles(self):
         rid, q = await self.api.subscribe({
-            "ticks_history": SYMBOL, "adjust_start_time": 1, "count": 100, "end": "latest",
+            "ticks_history": self.symbol, "adjust_start_time": 1, "count": 100, "end": "latest",
             "granularity": CANDLE_GRANULARITY, "style": "candles",
         })
         while not self.stopped:
@@ -1085,7 +1110,7 @@ class TradingBot:
                 self.current_open_time = int(candles[-1]["epoch"])
                 self.current_close = float(candles[-1]["close"])
                 fast, slow = self._ma()
-                log(f"Loaded {len(self.closes)} candles for {SYMBOL} | "
+                log(f"Loaded {len(self.closes)} candles for {self.symbol} | "
                     f"MA{MA_FAST}={fast.iloc[-1]:.5f} MA{MA_SLOW}={slow.iloc[-1]:.5f}")
             elif msg["msg_type"] == "ohlc":
                 o = msg["ohlc"]
@@ -1116,8 +1141,9 @@ class TradingBot:
             await self.authorize(account)
             if not self.risk_allows(0):   # balance target / daily limit already reached
                 return
-            await self.load_active_symbols(show=SHOW_ACTIVE_SYMBOLS and not self.symbols_shown)
+            show = SHOW_ACTIVE_SYMBOLS and not self.symbols_shown
             self.symbols_shown = True
+            await self.load_active_symbols(show=show)
             await self.resolve_contract()
             for info in list(self.pending_contracts.values()):
                 log(f"Resuming open contract #{info['contract_id']}")
@@ -1138,17 +1164,21 @@ class TradingBot:
             await self.api.close()
 
     async def run(self):
-        log(f"Vera Bot | {self.mode} | {SYMBOL} | MA{MA_FAST}/MA{MA_SLOW} + RSI{RSI_PERIOD} on "
+        log(f"Vera Bot | {self.mode} | {self.symbol} | MA{MA_FAST}/MA{MA_SLOW} + RSI{RSI_PERIOD} on "
             f"{CANDLE_GRANULARITY}s candles | stake {STAKE} | martingale {MARTINGALE} | "
             f"daily stop {f'-{DAILY_STOP_LOSS}' if DAILY_STOP_LOSS else 'off'} | "
             f"take profit {f'+{DAILY_TAKE_PROFIT}' if DAILY_TAKE_PROFIT else 'off'} | "
             f"target {BALANCE_TARGET or 'off'} | bankroll {BANKROLL or 'off'} | "
             f"today P/L {self.daily_pnl:+.2f}")
-        if not DRY_RUN:
+        if not self.first:
+            await asyncio.sleep(3)   # stagger logins when watching several markets
+        elif not DRY_RUN:
             log("!!! LIVE MODE - real contracts will be bought !!!")
-        log(f"Time zone: {TIMEZONE} (now {now_local():%H:%M %Z}) - the trading day resets at midnight")
-        log(f"Trades: crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} min without one | "
-            f"max {MAX_OPEN_TRADES} open | wait for next day {WAIT_NEXT_DAY}")
+        if self.first:
+            log(f"Markets: {', '.join(SYMBOLS)} | Time zone: {TIMEZONE} (now {now_local():%H:%M %Z}) - "
+                "the trading day resets at midnight")
+            log(f"Trades: crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} min without one | "
+                f"max {MAX_OPEN_TRADES} open | wait for next day {WAIT_NEXT_DAY}")
         while True:
             self.risk_allows(0)   # daily limit already hit today?
             await self.run_until_stopped()
@@ -1255,6 +1285,15 @@ def normalize_symbol(sym):
     return sym
 
 
+def _shared_attr(name):
+    return property(lambda self: getattr(self.shared, name),
+                    lambda self, value: setattr(self.shared, name, value))
+
+
+for _name in SHARED_FIELDS:
+    setattr(TradingBot, _name, _shared_attr(_name))
+
+
 def print_symbols(symbols):
     """Print active symbols grouped by market."""
     print(f"\n===== {len(symbols)} active Deriv symbols =====", flush=True)
@@ -1272,7 +1311,7 @@ def print_symbols(symbols):
     print(flush=True)
 
 
-async def backtest(n_ticks):
+async def backtest(n_ticks, symbol):
     """Replay the strategy on recent ticks for every contract type, priced with live payouts."""
     import numpy as np
     token = os.getenv("DERIV_TOKEN", "").strip()
@@ -1284,16 +1323,16 @@ async def backtest(n_ticks):
             await api.request({"authorize": token})
         currency = (account or {}).get("currency") or CURRENCY
         symbols = [normalize_symbol(x) for x in (await api.request({"active_symbols": "brief"}))["active_symbols"]]
-        info = next((x for x in symbols if x["symbol"] == SYMBOL), None)
+        info = next((x for x in symbols if x["symbol"] == symbol), None)
         if info is None:
-            raise SystemExit(f"Symbol {SYMBOL!r} is not an active Deriv symbol")
+            raise SystemExit(f"Symbol {symbol!r} is not an active Deriv symbol")
         decimals = pip_decimals(info)
 
-        log(f"Backtest {SYMBOL}: downloading {n_ticks} ticks...")
+        log(f"Backtest {symbol}: downloading {n_ticks} ticks...")
         prices, times, end = [], [], "latest"
         while len(prices) < n_ticks:   # the API sends up to 1000-5000 ticks per request
             want = min(5000, n_ticks - len(prices))
-            hist = (await api.request({"ticks_history": SYMBOL, "end": end, "count": want,
+            hist = (await api.request({"ticks_history": symbol, "end": end, "count": want,
                                        "style": "ticks"}, timeout=60)).get("history") or {}
             p, t = list(hist.get("prices") or []), list(hist.get("times") or [])
             if times:   # keep only ticks older than what we already have
@@ -1314,7 +1353,7 @@ async def backtest(n_ticks):
 
         # live payouts for each contract, priced once at STAKE
         try:
-            avail = (await api.request({"contracts_for": SYMBOL}))["contracts_for"]["available"]
+            avail = (await api.request({"contracts_for": symbol}))["contracts_for"]["available"]
             types = {c.get("contract_type") for c in avail}
         except DerivAPIError:
             types = set()
@@ -1322,7 +1361,7 @@ async def backtest(n_ticks):
 
         async def payout_for(contract_type, extra):
             req = {"proposal": 1, "amount": STAKE, "basis": "stake", "currency": currency,
-                   key[0]: SYMBOL, "contract_type": contract_type, **extra}
+                   key[0]: symbol, "contract_type": contract_type, **extra}
             try:
                 return float((await api.request(req))["proposal"]["payout"])
             except DerivAPIError as e:
@@ -1386,7 +1425,7 @@ async def backtest(n_ticks):
         return results
 
     hours = (epoch[-1] - epoch[0]) / 3600
-    print(f"\n===== Backtest {SYMBOL}: {len(price)} ticks, {len(closes)} candles, "
+    print(f"\n===== Backtest {symbol}: {len(price)} ticks, {len(closes)} candles, "
           f"{hours:.1f} h, stake {STAKE} {currency} =====")
     print(f"Strategy: MA{MA_FAST}/MA{MA_SLOW} crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} "
           f"min, RSI filter {'on' if RSI_FILTER else 'off'} (Rise/Fall only)\n")
@@ -1436,14 +1475,15 @@ async def list_symbols():
 
 
 async def main():
-    global SYMBOL
+    global SYMBOLS
     args = sys.argv[1:]
     if not API_URL:
         check_env()
     if "--backtest" in args:
         i = args.index("--backtest")
         n = int(args[i + 1]) if len(args) > i + 1 and args[i + 1].isdigit() else BACKTEST_TICKS
-        await backtest(n)
+        for symbol in SYMBOLS:
+            await backtest(n, symbol)
         return
     if "--symbols" in args:
         try:
@@ -1452,22 +1492,40 @@ async def main():
             explain_http_520(e)
             raise
         return
-    if args:
-        SYMBOL = args[0]
-    bot = TradingBot(os.getenv("DERIV_TOKEN", "").strip())
+    if args and not args[0].startswith("-"):
+        SYMBOLS = [x.strip() for x in args[0].split(",") if x.strip()]
+    token = os.getenv("DERIV_TOKEN", "").strip()
+    bots, shared = [], None
+    for symbol in SYMBOLS:
+        bot = TradingBot(token, symbol, shared)
+        shared = bot.shared
+        bots.append(bot)
     loop = asyncio.get_running_loop()
 
     def on_signal():
-        if bot.stopped:
-            for task in list(bot.trade_tasks):
-                task.cancel()                # second Ctrl+C: don't wait for open contracts
-        bot.daily_limit_hit = False          # Ctrl+C always quits, also while waiting for tomorrow
-        bot.stop("stopped by user (Ctrl+C)")
-        bot.stop_event.set()
+        if shared.stopped:
+            for bot in bots:
+                for task in list(bot.trade_tasks):
+                    task.cancel()            # second Ctrl+C: don't wait for open contracts
+        shared.daily_limit_hit = False       # Ctrl+C always quits, also while waiting for tomorrow
+        bots[0].stop("stopped by user (Ctrl+C)")
+        shared.stop_event.set()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, on_signal)
-    await bot.run()
+    async def run_market(bot):
+        try:
+            await bot.run()
+        except SystemExit as e:        # one market can't run -> stop them all, cleanly
+            shared.daily_limit_hit = False
+            bot.stop(f"{bot.symbol}: {e}")
+            shared.stop_event.set()
+            return f"{bot.symbol}: {e}"
+        return None
+
+    errors = [e for e in await asyncio.gather(*(run_market(bot) for bot in bots)) if e]
+    if errors:
+        raise SystemExit("\n".join(errors))
 
 
 if __name__ == "__main__":

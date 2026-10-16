@@ -54,7 +54,7 @@ Settings are at the top of `vera_bot.py`. The most common ones can also be set i
 | Setting | Default | Meaning |
 |---|---|---|
 | `ACCOUNT_TYPE` | `"demo"` | `"demo"` or `"real"`: which of your Deriv accounts to use |
-| `SYMBOL` | `"R_75"` | Any Deriv symbol: `BOOM1000`, `CRASH500`, `frxEURUSD`, `frxXAUUSD`… |
+| `SYMBOL` | `"R_75"` | One or more Deriv symbols, comma separated: `R_75` or `R_75,R_100`. Each market is watched on its own (own signals and 6-minute timer); balance, daily P/L, limits and `MAX_OPEN_TRADES` are shared. Any symbol works: `BOOM1000`, `CRASH500`, `frxEURUSD`, `frxXAUUSD`… |
 | `SHOW_ACTIVE_SYMBOLS` | `True` | Print all active symbols at startup |
 | `CONTRACT` | `"RISEFALL"` | What to trade: `RISEFALL`, `MULTIPLIER`, `DIGITEVEN`, `DIGITODD`, `DIGITMATCH`, `DIGITDIFF`, `DIGITOVER`, `DIGITUNDER`, or `AUTO` (before each trade, compare live payouts of all of them and take the one with the smallest Deriv edge) |
 | `DIGIT_BARRIER` | `5` | The digit for Matches / Differs / Over / Under (Over 0-8, Under 1-9) |
