@@ -718,9 +718,9 @@ class TradingBot:
             return
         side = "above" if direction == "RISE" else "below"
         if why == "cross":
-            log(f">>> Signal {direction}: MA{MA_FAST} crossed {side} MA{MA_SLOW} | RSI {rsi:.1f}")
+            log(f">>> {self.symbol} Signal {direction}: MA{MA_FAST} crossed {side} MA{MA_SLOW} | RSI {rsi:.1f}")
         else:
-            log(f">>> Trend trade {direction}: no trade for {TREND_TRADE_MINUTES} min, MA{MA_FAST} "
+            log(f">>> {self.symbol} Trend trade {direction}: no trade for {TREND_TRADE_MINUTES} min, MA{MA_FAST} "
                 f"{side} MA{MA_SLOW} | RSI {rsi:.1f}")
         rsi_ok = rsi_allows(direction, rsi)
         if not rsi_ok and self.kind in ("risefall", "multiplier"):
@@ -882,7 +882,7 @@ class TradingBot:
                 best = (edge, name, contract, barrier, req, proposal)
         if best is None:
             raise DerivAPIError({"code": "NoContract", "message": "no contract could be priced"})
-        log(f"AUTO expected return per trade: {' | '.join(report)} -> {best[1]}")
+        log(f"AUTO {self.symbol} expected return per trade: {' | '.join(report)} -> {best[1]}")
         return best[2:]
 
     async def trade(self, direction, ma_fast, ma_slow, rsi, rsi_ok=True):
