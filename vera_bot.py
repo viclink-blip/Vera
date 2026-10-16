@@ -938,7 +938,7 @@ class TradingBot:
         log(f"BOUGHT {self.symbol} {contract_type} #{contract_id} for {float(buy['buy_price']):.2f} "
             f"(balance {float(buy['balance_after']):.2f})")
         info = dict(direction=label, contract_type=contract_type, stake=stake,
-                    ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi, duration=duration,
+                    ma_fast=ma_fast, ma_slow=ma_slow, rsi=rsi, duration=duration, barrier=barrier,
                     contract_id=contract_id,
                     kind="multiplier" if contract == "MULTIPLIER" else "fixed",
                     sell_at=time.time() + MULT_HOLD_SECONDS)
@@ -985,10 +985,20 @@ class TradingBot:
             self.balance = float((await self.api.request({"balance": 1}))["balance"]["balance"])
         except Exception:  # noqa: BLE001
             self.balance = round(self.balance + profit, 2)
+        def first(*keys):
+            return next((poc[k] for k in keys if poc.get(k) not in (None, "")), None)
+        entry = first("entry_spot_display_value", "entry_tick_display_value", "entry_spot", "entry_tick")
+        exit_ = first("exit_spot_display_value", "exit_tick_display_value", "exit_spot", "exit_tick",
+                      "sell_spot_display_value", "sell_spot", "current_spot")
+        if info["contract_type"] in DIGIT_TYPES and exit_ is not None:
+            text = str(exit_)
+            digit = int(text[-1]) if isinstance(exit_, str) and text[-1].isdigit() \
+                else last_digit(exit_, self.decimals or 2)
+            if digit_wins(info["contract_type"], info.get("barrier"), digit) != (profit > 0):
+                log(f"Note: the exit price shown ({exit_}) is not the tick Deriv settled on - "
+                    f"Deriv's result counts. Fields sent: {', '.join(sorted(poc))}")
         self.finish_trade(info["direction"], info["contract_type"], info["stake"],
-                          info["ma_fast"], info["ma_slow"], info["rsi"],
-                          poc.get("entry_spot") or poc.get("entry_tick"),
-                          poc.get("exit_tick") or poc.get("sell_spot") or poc.get("current_spot"),
+                          info["ma_fast"], info["ma_slow"], info["rsi"], entry, exit_,
                           float(poc.get("payout", 0)), profit > 0, profit, info["contract_id"],
                           info.get("duration"))
 
