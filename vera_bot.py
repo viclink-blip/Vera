@@ -64,7 +64,7 @@ ACCOUNT_TYPE = setting("ACCOUNT_TYPE", "demo")  # "demo" or "real" - which of yo
 SYMBOL = setting("SYMBOL", "R_75")  # any Deriv symbol, e.g. R_75, R_100, 1HZ100V, BOOM1000,
                              # CRASH500, JD25, frxEURUSD, frxXAUUSD, cryBTCUSD ...
                              # run `python3 vera_bot.py --symbols` to see them all
-SHOW_ACTIVE_SYMBOLS = True   # print every active Deriv symbol at startup
+SHOW_ACTIVE_SYMBOLS = setting("SHOW_ACTIVE_SYMBOLS", True)  # print every active symbol at startup
 
 CONTRACT = setting("CONTRACT", "RISEFALL")  # what to trade:
                              #   RISEFALL   - Rise/Fall by the MA/RSI signal (Multipliers if
