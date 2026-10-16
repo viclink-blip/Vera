@@ -440,10 +440,11 @@ class Shared:
         self.stopped = False
         self.stop_reason = ""
         self.stop_event = asyncio.Event()
+        self.pnl_account = None                # account whose P/L daily_pnl holds
         self.bots = []
 
 
-SHARED_FIELDS = ("balance", "sim_balance_set", "symbols_shown", "stake", "loss_streak",
+SHARED_FIELDS = ("pnl_account", "balance", "sim_balance_set", "symbols_shown", "stake", "loss_streak",
                  "trading_day", "daily_pnl", "open_stake", "daily_limit_hit", "stopped",
                  "stop_reason", "stop_event")
 
@@ -478,7 +479,6 @@ class TradingBot:
 
         if self.first:
             self._migrate_csv()
-            self.daily_pnl = self._load_today_pnl()
 
         self.trade_tasks = set()               # running trades on this market
         self.pending_contracts = {}            # contract_id -> info, resumed after reconnect
@@ -516,7 +516,12 @@ class TradingBot:
         return round(BANKROLL + total, 2)
 
     def set_balance(self, account_balance):
-        """Set the balance the bot trades with, once per run for dry run / bankroll."""
+        """Set the balance the bot trades with, once per run for dry run / bankroll.
+        Also loads today's P/L - for this account only, so demo and real don't mix."""
+        if self.pnl_account != self.account:
+            self.pnl_account = self.account
+            self.daily_pnl = self._load_today_pnl()
+            log(f"Today's P/L on {self.account}: {self.daily_pnl:+.2f} {self.currency}")
         if self.sim_balance_set and (DRY_RUN or BANKROLL):
             return
         self.sim_balance_set = True
@@ -536,7 +541,8 @@ class TradingBot:
             if df.empty:
                 return 0.0
             ts = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert(TZ)
-            today = (ts.dt.date == now_local().date()) & (df["mode"] == self.mode)
+            today = ((ts.dt.date == now_local().date()) & (df["mode"] == self.mode)
+                     & (df["account"].astype(str) == str(self.account)))
             return round(float(df.loc[today, "profit"].sum()), 2)
         except Exception as e:  # noqa: BLE001
             log(f"Could not read {CSV_FILE.name} ({e}); daily P/L starts at 0")
@@ -1168,8 +1174,7 @@ class TradingBot:
             f"{CANDLE_GRANULARITY}s candles | stake {STAKE} | martingale {MARTINGALE} | "
             f"daily stop {f'-{DAILY_STOP_LOSS}' if DAILY_STOP_LOSS else 'off'} | "
             f"take profit {f'+{DAILY_TAKE_PROFIT}' if DAILY_TAKE_PROFIT else 'off'} | "
-            f"target {BALANCE_TARGET or 'off'} | bankroll {BANKROLL or 'off'} | "
-            f"today P/L {self.daily_pnl:+.2f}")
+            f"target {BALANCE_TARGET or 'off'} | bankroll {BANKROLL or 'off'}")
         if not self.first:
             await asyncio.sleep(3)   # stagger logins when watching several markets
         elif not DRY_RUN:
