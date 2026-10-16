@@ -147,7 +147,7 @@ Other behaviour:
 
 - Only one trade is open at a time. Signals that arrive while a trade is open are skipped.
 - If the connection drops, the bot reconnects with backoff. It also resumes watching a live contract that was open at the time.
-- Today's P/L (UTC day) is read back from the CSV at startup, so restarting the bot does not reset the daily stop loss.
+- Today's P/L (day in `TIMEZONE`, East Africa Time by default) is read back from the CSV at startup, so restarting the bot does not reset the daily stop loss.
 - Before each trade the bot checks that losing the next stake would not push you past `DAILY_STOP_LOSS`. If it would, the bot stops. This matters most with martingale on.
 
 ### CSV columns
