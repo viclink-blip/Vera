@@ -29,7 +29,8 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pathlib import Path
 
 import pandas as pd
@@ -107,7 +108,10 @@ TREND_TRADE_MINUTES = setting("TREND_TRADE_MINUTES", 6)  # no trade for this man
                              # trade the current trend (MA7 above MA14 = Rise, below = Fall).
                              # 6 gives at least 5 trades per 30 min. 0 = crossovers only
 WAIT_NEXT_DAY = setting("WAIT_NEXT_DAY", True)  # after a daily stop loss / take profit,
-                             # pause until 00:00 UTC and carry on (for 24h running)
+                             # pause until midnight (TIMEZONE) and carry on (for 24h running)
+TIMEZONE = setting("TIMEZONE", "Africa/Nairobi")  # clock for logs, the CSV and the trading
+                             # day (daily P/L resets at midnight here). Africa/Nairobi =
+                             # East Africa Time (UTC+3); e.g. Africa/Dar_es_Salaam, UTC
 
 MARTINGALE = setting("MARTINGALE", False)  # after a loss, next stake = previous stake x MULTIPLIER
 MARTINGALE_MULTIPLIER = 2.1
@@ -140,12 +144,19 @@ CSV_COLUMNS = [
 ]
 
 
-def now_utc():
-    return datetime.now(timezone.utc)
+try:
+    TZ = ZoneInfo(TIMEZONE)
+except (ZoneInfoNotFoundError, ValueError):
+    print(f"Unknown TIMEZONE {TIMEZONE!r} - using East Africa Time (UTC+3)", flush=True)
+    TZ = timezone(timedelta(hours=3), "EAT")
+
+
+def now_local():
+    return datetime.now(TZ)
 
 
 def log(msg):
-    print(f"[{now_utc():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
+    print(f"[{now_local():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
 class DerivAPIError(Exception):
@@ -436,7 +447,7 @@ class TradingBot:
 
         self.stake = float(STAKE)
         self.loss_streak = 0
-        self.trading_day = now_utc().date()
+        self.trading_day = now_local().date()
         self._migrate_csv()
         self.daily_pnl = self._load_today_pnl()
 
@@ -500,8 +511,8 @@ class TradingBot:
             df = pd.read_csv(CSV_FILE)
             if df.empty:
                 return 0.0
-            ts = pd.to_datetime(df["time"], utc=True, errors="coerce")
-            today = (ts.dt.date == now_utc().date()) & (df["mode"] == self.mode)
+            ts = pd.to_datetime(df["time"], utc=True, errors="coerce").dt.tz_convert(TZ)
+            today = (ts.dt.date == now_local().date()) & (df["mode"] == self.mode)
             return round(float(df.loc[today, "profit"].sum()), 2)
         except Exception as e:  # noqa: BLE001
             log(f"Could not read {CSV_FILE.name} ({e}); daily P/L starts at 0")
@@ -717,7 +728,7 @@ class TradingBot:
 
     # --------------------------------------------------------------- risk
     def check_day_rollover(self):
-        today = now_utc().date()
+        today = now_local().date()
         if today != self.trading_day:
             log(f"New day {today} - daily P/L reset (was {self.daily_pnl:+.2f})")
             self.trading_day = today
@@ -1031,7 +1042,7 @@ class TradingBot:
         log(f"{'✅' if won else '❌'} {result} {direction} | entry {entry} exit {exit_spot} | "
             f"P/L {profit:+.2f} | day {self.daily_pnl:+.2f} | balance {self.balance:.2f} {self.currency}")
         row = {
-            "time": now_utc().isoformat(timespec="seconds"), "mode": self.mode,
+            "time": now_local().isoformat(timespec="seconds"), "mode": self.mode,
             "account": self.account, "symbol": SYMBOL, "direction": direction,
             "contract_type": contract_type, "duration": duration or self.duration_label(self.contract),
             "stake": f"{stake:.2f}", "ma_fast": f"{ma_fast:.5f}", "ma_slow": f"{ma_slow:.5f}",
@@ -1135,6 +1146,7 @@ class TradingBot:
             f"today P/L {self.daily_pnl:+.2f}")
         if not DRY_RUN:
             log("!!! LIVE MODE - real contracts will be bought !!!")
+        log(f"Time zone: {TIMEZONE} (now {now_local():%H:%M %Z}) - the trading day resets at midnight")
         log(f"Trades: crossovers + trend trade after {TREND_TRADE_MINUTES or 'off'} min without one | "
             f"max {MAX_OPEN_TRADES} open | wait for next day {WAIT_NEXT_DAY}")
         while True:
@@ -1142,10 +1154,11 @@ class TradingBot:
             await self.run_until_stopped()
             if not (WAIT_NEXT_DAY and self.daily_limit_hit):
                 break
-            now = now_utc()
-            midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp() + 86400
-            wait = midnight - now.timestamp() + 5
-            log(f"Daily limit reached - pausing until 00:00 UTC ({wait / 3600:.1f} h). Ctrl+C to quit.")
+            now = now_local()
+            midnight = datetime.combine(now.date() + timedelta(days=1), dtime(0), tzinfo=TZ)
+            wait = midnight.timestamp() - now.timestamp() + 5
+            log(f"Daily limit reached - pausing until 00:00 {now:%Z} ({wait / 3600:.1f} h). "
+                "Ctrl+C to quit.")
             self.stop_event.clear()
             try:
                 await asyncio.wait_for(self.stop_event.wait(), wait)

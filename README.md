@@ -49,7 +49,7 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_TIMEZONE`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -72,7 +72,8 @@ Settings are at the top of `vera_bot.py`. The most common ones can also be set i
 | `CANDLE_GRANULARITY` | `60` | Candle size in seconds |
 | `MAX_OPEN_TRADES` | `3` | How many trades can be open at the same time; a new signal is only skipped when this many are open |
 | `TREND_TRADE_MINUTES` | `6` | If no trade happened for this many minutes, trade the current trend (MA7 above MA14 = Rise, below = Fall, RSI filter still applies). `6` gives at least 5 trades per 30 minutes; `0` = crossovers only |
-| `WAIT_NEXT_DAY` | `True` | After the daily stop loss / take profit, pause until 00:00 UTC and carry on instead of exiting |
+| `TIMEZONE` | `"Africa/Nairobi"` | Clock for the log, `vera_trades.csv` and the trading day. Daily P/L, take profit and stop loss reset at midnight in this time zone. Default is East Africa Time (UTC+3); any name like `Africa/Dar_es_Salaam`, `Africa/Kampala` or `UTC` works |
+| `WAIT_NEXT_DAY` | `True` | After the daily stop loss / take profit, pause until midnight (`TIMEZONE`) and carry on instead of exiting |
 | `MARTINGALE` | `False` | After a loss, multiply the next stake by `MARTINGALE_MULTIPLIER` (2.1) |
 | `MARTINGALE_MAX_STEPS` | `5` | Go back to `STAKE` after this many losses in a row |
 | `DAILY_STOP_LOSS` | `10` | Stop when today's P/L reaches -10 USD |
