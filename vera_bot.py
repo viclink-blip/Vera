@@ -813,8 +813,8 @@ class TradingBot:
             self.ai = ai
             self.ticks.extend(float(x) for x in prices[-self.ticks.maxlen:])
             log(ai.summary())
-        except (DerivAPIError, ValueError) as e:
-            log(f"AI {self.symbol}: training failed ({e}) - will retry later")
+        except Exception as e:  # noqa: BLE001 - never let training take the bot down
+            log(f"AI {self.symbol}: training failed ({type(e).__name__}: {e}) - will retry later")
         finally:
             self.ai_training = False
 
