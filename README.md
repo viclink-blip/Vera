@@ -49,7 +49,7 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_TIMEZONE`, `VERA_SHOW_ACTIVE_SYMBOLS`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_TIMEZONE`, `VERA_SHOW_ACTIVE_SYMBOLS`, `VERA_STRATEGY`, `VERA_AI_MIN_EDGE`, `VERA_AI_TRAIN_TICKS`, `VERA_AI_RETRAIN_HOURS`, `VERA_AI_FORCE`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -106,6 +106,25 @@ Run it in the background on a server:
 nohup python3 vera_bot.py >> bot.log 2>&1 &
 tail -f bot.log
 ```
+
+## AI mode (`VERA_STRATEGY=AI`)
+
+Instead of the MA/RSI signals, two machine-learning models (gradient boosting, scikit-learn) decide **when** to trade and **which contract** to buy:
+
+- **Learn:** from the last `AI_TRAIN_TICKS` ticks of each market (about 40 features: recent moves, volatility, momentum, digit frequencies, last digits). One model predicts the direction after `DIGIT_TICKS` ticks, the other predicts the exact last digit.
+- **Choose:** from those two predictions the win chance of every contract is derived (Rise, Fall, Even, Odd, Matches/Differs/Over/Under on every digit). With Deriv's live payouts, the contract with the best predicted expected return is picked.
+- **Calibrate:** a separate slice of ticks decides how much to trust each model. If a model learned nothing, its trust drops to 0% and the win chances fall back to plain frequencies.
+- **Prove it:** a walk-forward test on the newest ticks (never used for training) simulates trading with real payouts. The AI may only trade if that unseen test is profitable and clearly better than luck (z-score ≥ 2, at least 30 trades).
+- **Trade:** only when the predicted expected return is above `AI_MIN_EDGE` (default +2%), through the same limits as always (stake, daily stop/take profit, balance target, max open trades).
+- **Retrain:** every `AI_RETRAIN_HOURS` hours on fresh ticks.
+
+```bash
+python3 vera_bot.py --train      # train + test now and print the report
+```
+
+On Deriv's random-number markets (Volatility, Jump, Step indices…) the honest result is **"NO PROVEN EDGE - stands aside"**: there is nothing to predict, and the AI protects your money by not trading. `VERA_AI_FORCE=true` makes it trade anyway (for demo testing only).
+
+The AI uses classic machine learning, not a chat model: language models can't predict random ticks either, and each question would cost time and money.
 
 ## Backtest: test before you trade
 

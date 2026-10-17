@@ -17,6 +17,7 @@ Run      : python3 vera_bot.py              (uses SYMBOL below)
            python3 vera_bot.py BOOM1000     (override the symbol)
            python3 vera_bot.py --symbols    (list active symbols and exit)
            python3 vera_bot.py --backtest   (test every contract type on recent ticks)
+           python3 vera_bot.py --train      (train + test the AI models, VERA_STRATEGY=AI)
 """
 
 import asyncio
@@ -27,6 +28,7 @@ import os
 import signal
 import sys
 import time
+import collections
 import urllib.error
 import urllib.request
 from datetime import datetime, time as dtime, timedelta, timezone
@@ -106,6 +108,14 @@ RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
 
 BACKTEST_TICKS = 20000       # default history for `python3 vera_bot.py --backtest`
+
+STRATEGY = setting("STRATEGY", "MA")   # "MA": MA/RSI signals (CONTRACT decides what to buy)
+                             # "AI": machine-learning models pick when and what to trade,
+                             #       only if they pass the walk-forward test (see vera_ai.py)
+AI_MIN_EDGE = setting("AI_MIN_EDGE", 0.02)       # trade only above +2% predicted expected return
+AI_TRAIN_TICKS = setting("AI_TRAIN_TICKS", 40000)  # history the models learn from
+AI_RETRAIN_HOURS = setting("AI_RETRAIN_HOURS", 6)  # retrain on fresh ticks this often
+AI_FORCE = setting("AI_FORCE", False)  # True = trade even without a proven edge (demo testing)
 
 MAX_OPEN_TRADES = setting("MAX_OPEN_TRADES", 3)  # trades allowed open at the same time
 TREND_TRADE_MINUTES = setting("TREND_TRADE_MINUTES", 6)  # no trade for this many minutes ->
@@ -484,6 +494,11 @@ class TradingBot:
         self.pending_contracts = {}            # contract_id -> info, resumed after reconnect
         self.last_trade_time = time.time()
         self.tick_listeners = []               # dry-run simulators waiting on ticks
+        self.ticks = collections.deque(maxlen=200)   # recent prices for the AI
+        self.ai = None
+        self.ai_training = False
+        self.ai_payouts = {}
+        self.ai_last_note = 0.0
 
     # ------------------------------------------------------------------ setup
     @property
@@ -718,6 +733,9 @@ class TradingBot:
         rsi = rsi_s.iloc[-1]
         log(f"{self.symbol} candle close {close} | MA{MA_FAST}={f_now:.5f} MA{MA_SLOW}={s_now:.5f} "
             f"RSI{RSI_PERIOD}={rsi:.1f}")
+        if STRATEGY == "AI":
+            self.ai_decide(f_now, s_now, rsi)
+            return
 
         direction, why = decide(f_prev, s_prev, f_now, s_now, (time.time() - self.last_trade_time) / 60)
         if not direction:
@@ -740,6 +758,97 @@ class TradingBot:
         self.last_trade_time = time.time()
         self.start_task(self.trade(direction, f_now, s_now, rsi, rsi_ok))
 
+    # ----------------------------------------------------------------- AI
+    async def load_ai_payouts(self):
+        """Live payout of every contract the AI can choose, at the current stake."""
+        from vera_ai import candidates
+        stake = round(self.stake, 2)
+        payouts = {}
+        for contract, barrier in candidates():
+            ct_ok = contract in ("CALL", "PUT") or not self.available_types or contract in self.available_types
+            if not ct_ok:
+                continue
+            req = {"proposal": 1, "amount": stake, "basis": "stake", "currency": self.currency,
+                   self.symbol_key: self.symbol, "contract_type": contract,
+                   "duration": DIGIT_TICKS, "duration_unit": "t"}
+            if barrier is not None:
+                req["barrier"] = str(barrier)
+            try:
+                payouts[(contract, barrier)] = float((await self.request_proposal(req)).get("payout") or 0)
+            except DerivAPIError:
+                pass
+        if not payouts:
+            raise DerivAPIError({"code": "NoPayouts", "message": "no contract could be priced for the AI"})
+        self.ai_payouts = payouts
+        return payouts
+
+    async def ensure_ai(self):
+        from vera_ai import VeraAI
+        if self.ai is None:
+            self.ai = VeraAI.load(self.symbol)
+        ai = self.ai
+        stale = (ai is None or ai.stake != round(self.stake, 2) or ai.horizon != DIGIT_TICKS
+                 or time.time() - ai.trained_at > AI_RETRAIN_HOURS * 3600)
+        if stale:
+            await self.train_ai()
+        else:
+            self.ai_payouts = ai.payouts
+            log(ai.summary() + f" | trained {(time.time() - ai.trained_at) / 3600:.1f} h ago")
+            prices, _ = await download_ticks(self.api, self.symbol, self.ticks.maxlen)
+            self.ticks.extend(float(x) for x in prices)
+
+    async def train_ai(self):
+        from vera_ai import VeraAI
+        if self.ai_training:
+            return
+        self.ai_training = True
+        try:
+            log(f"AI {self.symbol}: downloading {AI_TRAIN_TICKS} ticks and live payouts to train...")
+            prices, _ = await download_ticks(self.api, self.symbol, AI_TRAIN_TICKS)
+            payouts = await self.load_ai_payouts()
+            decimals = self.decimals if self.decimals is not None else infer_decimals(prices)
+            ai = VeraAI(self.symbol, decimals, DIGIT_TICKS, round(self.stake, 2), payouts)
+            await asyncio.to_thread(ai.fit, [float(x) for x in prices], AI_MIN_EDGE)
+            ai.save()
+            self.ai = ai
+            self.ticks.extend(float(x) for x in prices[-self.ticks.maxlen:])
+            log(ai.summary())
+        except (DerivAPIError, ValueError) as e:
+            log(f"AI {self.symbol}: training failed ({e}) - will retry later")
+        finally:
+            self.ai_training = False
+
+    def ai_decide(self, ma_fast, ma_slow, rsi):
+        from vera_ai import label
+        if self.ai is None or self.ai_training:
+            return
+        if time.time() - self.ai.trained_at > AI_RETRAIN_HOURS * 3600:
+            asyncio.create_task(self.train_ai())
+            return
+        pred = self.ai.predict(list(self.ticks))
+        if pred is None:
+            log(f"AI {self.symbol}: collecting ticks {len(self.ticks)}/30")
+            return
+        contract, barrier, prob, ev = self.ai.best_contract(*pred, payouts=self.ai_payouts or None)
+        name = label(contract, barrier)
+        if not (self.ai.passed or AI_FORCE):
+            if time.time() - self.ai_last_note > 3600:
+                self.ai_last_note = time.time()
+                log(f"AI {self.symbol}: no proven edge in the unseen-tick test - standing aside "
+                    f"(best idea now {name}, predicted {ev:+.1%}). Retrains every {AI_RETRAIN_HOURS} h.")
+            return
+        if ev <= AI_MIN_EDGE:
+            log(f"AI {self.symbol}: best {name} predicted {ev:+.1%} - not above +{AI_MIN_EDGE:.0%}, no trade")
+            return
+        open_now = sum(len(b.trade_tasks) for b in self.shared.bots)
+        if open_now >= MAX_OPEN_TRADES:
+            log(f"{open_now} trades already open (MAX_OPEN_TRADES) - {self.symbol} AI signal skipped")
+            return
+        log(f">>> AI {self.symbol}: {name} | win chance {prob:.1%} | predicted {ev:+.1%}")
+        direction = "RISE" if contract == "CALL" else "FALL" if contract == "PUT" else "AI"
+        self.last_trade_time = time.time()
+        self.start_task(self.trade(direction, ma_fast, ma_slow, rsi, True, ai=(contract, barrier, prob)))
+
     def start_task(self, coro):
         task = asyncio.create_task(coro)
         self.trade_tasks.add(task)
@@ -754,6 +863,7 @@ class TradingBot:
 
     def on_tick(self, epoch, quote):
         self.last_tick_epoch = epoch
+        self.ticks.append(quote)
         for listener in list(self.tick_listeners):
             listener(epoch, quote)
 
@@ -891,19 +1001,29 @@ class TradingBot:
         log(f"AUTO {self.symbol} expected return per trade: {' | '.join(report)} -> {best[1]}")
         return best[2:]
 
-    async def trade(self, direction, ma_fast, ma_slow, rsi, rsi_ok=True):
+    async def trade(self, direction, ma_fast, ma_slow, rsi, rsi_ok=True, ai=None):
         stake = round(self.stake, 2)
         if self.stopped or not self.risk_allows(stake):
             return
         self.open_stake = round(self.open_stake + stake, 2)
         try:
-            await self._trade(direction, stake, ma_fast, ma_slow, rsi, rsi_ok)
+            await self._trade(direction, stake, ma_fast, ma_slow, rsi, rsi_ok, ai)
         finally:
             self.open_stake = round(self.open_stake - stake, 2)
 
-    async def _trade(self, direction, stake, ma_fast, ma_slow, rsi, rsi_ok):
+    async def _trade(self, direction, stake, ma_fast, ma_slow, rsi, rsi_ok, ai=None):
         try:
-            contract, barrier, req, proposal = await self.pick_contract(direction, stake, rsi_ok)
+            if ai:
+                contract, barrier, prob = ai
+                if contract in ("CALL", "PUT"):
+                    req = self.proposal_request(direction, stake, "RISEFALL")
+                    req["duration"], req["duration_unit"] = DIGIT_TICKS, "t"
+                    contract = "RISEFALL"
+                else:
+                    req = self.proposal_request(direction, stake, contract, barrier)
+                proposal = await self.request_proposal(req)
+            else:
+                contract, barrier, req, proposal = await self.pick_contract(direction, stake, rsi_ok)
         except DerivAPIError as e:
             log(f"Proposal rejected: {e}")
             return
@@ -911,6 +1031,13 @@ class TradingBot:
         label = digit_label(contract, barrier) if contract in DIGIT_TYPES else direction
         duration = self.duration_label(contract)
         payout = float(proposal.get("payout") or 0)
+        if ai:
+            label = "AI " + label
+            duration = f"{DIGIT_TICKS}t"
+            live_ev = prob * payout / stake - 1
+            if live_ev <= AI_MIN_EDGE and not AI_FORCE:
+                log(f"AI {self.symbol}: live payout {payout:.2f} gives {live_ev:+.1%} - trade cancelled")
+                return
         extra = (f"x{self.multiplier} commission {float(proposal.get('commission') or 0):.2f}"
                  if contract == "MULTIPLIER" else f"payout {payout:.2f}")
         log(f"Proposal {contract_type}{' ' + str(barrier) if needs_barrier(contract) else ''} "
@@ -922,7 +1049,8 @@ class TradingBot:
                     contract_type, stake, float(proposal.get("commission") or 0))
                 won = profit > 0
             else:
-                entry, exit_, won = await self.simulate(contract_type, barrier)
+                entry, exit_, won = await self.simulate(contract_type, barrier,
+                                                        DIGIT_TICKS if ai else None)
                 profit = round(payout - stake, 2) if won else -stake
             self.balance = round(self.balance + profit, 2)
             self.finish_trade(label, contract_type, stake, ma_fast, ma_slow, rsi,
@@ -1037,7 +1165,7 @@ class TradingBot:
             self.tick_listeners.remove(listener)
         return state["entry"], exit_spot, profit
 
-    async def simulate(self, contract_type, barrier=None):
+    async def simulate(self, contract_type, barrier=None, ticks=None):
         """Dry run: mimic Deriv settlement on the live price feed.
         Entry = first tick after purchase; exit = Nth tick after entry
         (tick contracts) or the last tick at/before expiry (time contracts)."""
@@ -1046,6 +1174,8 @@ class TradingBot:
         state = {"entry": None, "entry_epoch": None, "ticks": 0, "last": None}
         digit = contract_type in DIGIT_TYPES
         dur, unit = (DIGIT_TICKS, "t") if digit else (self.duration, self.duration_unit)
+        if ticks:
+            dur, unit = ticks, "t"
         expiry_secs = duration_to_seconds(dur, unit)
 
         def listener(epoch, quote):
@@ -1161,6 +1291,8 @@ class TradingBot:
             self.symbols_shown = True
             await self.load_active_symbols(show=show)
             await self.resolve_contract()
+            if STRATEGY == "AI":
+                await self.ensure_ai()
             for info in list(self.pending_contracts.values()):
                 log(f"Resuming open contract #{info['contract_id']}")
                 self.start_task(self.watch_contract(info))
@@ -1326,6 +1458,50 @@ def print_symbols(symbols):
     print(flush=True)
 
 
+def infer_decimals(prices):
+    return max(len(str(x).split(".")[1]) if "." in str(x) else 0 for x in prices[-500:])
+
+
+async def download_ticks(api, symbol, n_ticks):
+    """Most recent n_ticks prices/times, paged backwards (the API sends 1000-5000 per request)."""
+    prices, times, end = [], [], "latest"
+    while len(prices) < n_ticks:
+        want = min(5000, n_ticks - len(prices))
+        hist = (await api.request({"ticks_history": symbol, "end": end, "count": want,
+                                   "style": "ticks"}, timeout=60)).get("history") or {}
+        p, t = list(hist.get("prices") or []), list(hist.get("times") or [])
+        if times:   # keep only ticks older than what we already have
+            keep = [i for i, x in enumerate(t) if int(x) < int(times[0])]
+            p, t = [p[i] for i in keep], [t[i] for i in keep]
+        if not p:
+            break
+        prices, times, end = p + prices, t + times, int(t[0]) - 1
+        if len(prices) % 10000 < len(p):
+            log(f"  {symbol}: {len(prices)} ticks...")
+    return prices, times
+
+
+async def train_cli(symbol):
+    """`--train`: train and test the AI for one market, print the report."""
+    token = os.getenv("DERIV_TOKEN", "").strip()
+    bot = TradingBot(token, symbol)
+    url, account = await get_session(token)
+    bot.api = DerivAPI(url)
+    await bot.api.connect()
+    try:
+        await bot.authorize(account)
+        await bot.load_active_symbols(show=False)
+        await bot.resolve_contract()
+        await bot.train_ai()
+        if bot.ai:
+            r = bot.ai.report
+            print(f"\n===== AI {symbol} =====\n{bot.ai.summary()}\n"
+                  f"Contracts it picked in the unseen test: {r.get('picks')}\n"
+                  "Log-loss below the chance value = the model learned something real; equal = nothing to learn.")
+    finally:
+        await bot.api.close()
+
+
 async def backtest(n_ticks, symbol):
     """Replay the strategy on recent ticks for every contract type, priced with live payouts."""
     import numpy as np
@@ -1344,24 +1520,11 @@ async def backtest(n_ticks, symbol):
         decimals = pip_decimals(info)
 
         log(f"Backtest {symbol}: downloading {n_ticks} ticks...")
-        prices, times, end = [], [], "latest"
-        while len(prices) < n_ticks:   # the API sends up to 1000-5000 ticks per request
-            want = min(5000, n_ticks - len(prices))
-            hist = (await api.request({"ticks_history": symbol, "end": end, "count": want,
-                                       "style": "ticks"}, timeout=60)).get("history") or {}
-            p, t = list(hist.get("prices") or []), list(hist.get("times") or [])
-            if times:   # keep only ticks older than what we already have
-                keep = [i for i, x in enumerate(t) if int(x) < int(times[0])]
-                p, t = [p[i] for i in keep], [t[i] for i in keep]
-            if not p:
-                break
-            prices, times, end = p + prices, t + times, int(t[0]) - 1
-            if len(prices) % 10000 < len(p):
-                log(f"  {len(prices)} ticks...")
+        prices, times = await download_ticks(api, symbol, n_ticks)
         if len(prices) < 500:
             raise SystemExit(f"Only {len(prices)} ticks available - not enough for a backtest")
         if decimals is None:
-            decimals = max(len(str(x).split(".")[1]) if "." in str(x) else 0 for x in prices[-500:])
+            decimals = infer_decimals(prices)
         price = np.array([float(x) for x in prices])
         epoch = np.array([int(x) for x in times])
         digits = np.array([last_digit(x, decimals) for x in price])
@@ -1494,6 +1657,10 @@ async def main():
     args = sys.argv[1:]
     if not API_URL:
         check_env()
+    if "--train" in args:
+        for symbol in SYMBOLS:
+            await train_cli(symbol)
+        return
     if "--backtest" in args:
         i = args.index("--backtest")
         n = int(args[i + 1]) if len(args) > i + 1 and args[i + 1].isdigit() else BACKTEST_TICKS
