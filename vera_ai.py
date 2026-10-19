@@ -71,11 +71,14 @@ def targets(prices, digits, horizon):
     return rise, dig, ok
 
 
-def candidates():
-    """Every contract the AI can choose: (contract_type, barrier)."""
+def candidates(allowed=None):
+    """Contracts the AI can choose: (contract_type, barrier). `allowed` limits the types,
+    e.g. ("DIGITEVEN", "DIGITODD") for a dedicated Even/Odd AI."""
     out = [("CALL", None), ("PUT", None), ("DIGITEVEN", None), ("DIGITODD", None)]
     out += [("DIGITDIFF", b) for b in range(10)] + [("DIGITMATCH", b) for b in range(10)]
     out += [("DIGITOVER", b) for b in range(9)] + [("DIGITUNDER", b) for b in range(1, 10)]
+    if allowed:
+        out = [(c, b) for c, b in out if c in allowed]
     return out
 
 
@@ -124,8 +127,9 @@ def label(contract, barrier):
 class VeraAI:
     """Trained models for one market plus their walk-forward report."""
 
-    def __init__(self, symbol, decimals, horizon, stake, payouts):
+    def __init__(self, symbol, decimals, horizon, stake, payouts, allowed=()):
         self.symbol, self.decimals, self.horizon = symbol, decimals, horizon
+        self.allowed = tuple(sorted(allowed))          # empty = every contract
         self.stake, self.payouts = stake, payouts      # {(contract, barrier): payout at `stake`}
         self.rise_model = self.digit_model = None
         self.base_rise, self.base_digits = 0.5, np.full(10, 0.1)   # plain frequencies
@@ -173,6 +177,8 @@ class VeraAI:
             "trust_rise": self.trust_rise, "trust_digit": self.trust_digit,
             "rise_accuracy": float(((pr > 0.5) == rt).mean()),
             "digit_accuracy": float((pd_.argmax(axis=1) == dt).mean()),
+            # Even/Odd: predict "even" when the model gives even digits more than 50%
+            "evenodd_accuracy": float(((pd_[:, 0::2].sum(axis=1) > 0.5) == (dt % 2 == 0)).mean()),
             # log-loss below chance level means the model learned something real
             "rise_logloss": float(log_loss(rt, pr, labels=[0, 1])), "rise_logloss_chance": math.log(2),
             "digit_logloss": float(log_loss(dt, pd_, labels=list(range(10)))),
@@ -258,10 +264,12 @@ class VeraAI:
     def summary(self):
         r = self.report
         verdict = "PASSED - may trade" if self.passed else "NO PROVEN EDGE - stands aside"
-        return (f"AI {self.symbol}: {verdict} | unseen test: {r.get('test_trades', 0)} trades, "
+        only = f" [{'/'.join(label(c, None) for c in self.allowed)} only]" if getattr(self, "allowed", ()) else ""
+        return (f"AI {self.symbol}{only}: {verdict} | unseen test: {r.get('test_trades', 0)} trades, "
                 f"win {r.get('test_win_rate', 0):.0%}, P/L {r.get('test_pl', 0):+.2f}, "
                 f"{r.get('test_return_per_trade', 0):+.1%}/trade, z={r.get('z', 0):.1f} | "
                 f"trust in model: direction {self.trust_rise:.0%}, digits {self.trust_digit:.0%} | "
+                f"even/odd acc {r.get('evenodd_accuracy', 0):.1%} (chance 50%), "
                 f"digit acc {r.get('digit_accuracy', 0):.1%} (chance 10%), "
                 f"rise acc {r.get('rise_accuracy', 0):.1%} (chance 50%) | "
                 f"log-loss digit {r.get('digit_logloss', 0):.3f} vs {r.get('digit_logloss_chance', 0):.3f}, "

@@ -49,7 +49,7 @@ DERIV_TOKEN=pat_xxxxxxxxxxxxxxxx
 DERIV_APP_ID=12345
 ```
 
-Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_TIMEZONE`, `VERA_SHOW_ACTIVE_SYMBOLS`, `VERA_STRATEGY`, `VERA_AI_MIN_EDGE`, `VERA_AI_TRAIN_TICKS`, `VERA_AI_RETRAIN_HOURS`, `VERA_AI_FORCE`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
+Settings are at the top of `vera_bot.py`. The most common ones can also be set in `.env` as `VERA_<NAME>=value`: `VERA_ACCOUNT_TYPE`, `VERA_SYMBOL`, `VERA_STAKE`, `VERA_DRY_RUN`, `VERA_BANKROLL`, `VERA_DAILY_STOP_LOSS`, `VERA_DAILY_TAKE_PROFIT`, `VERA_BALANCE_TARGET`, `VERA_MARTINGALE`, `VERA_MAX_OPEN_TRADES`, `VERA_TREND_TRADE_MINUTES`, `VERA_WAIT_NEXT_DAY`, `VERA_TIMEZONE`, `VERA_SHOW_ACTIVE_SYMBOLS`, `VERA_STRATEGY`, `VERA_AI_MIN_EDGE`, `VERA_AI_TRAIN_TICKS`, `VERA_AI_RETRAIN_HOURS`, `VERA_AI_CONTRACTS`, `VERA_AI_FORCE`, `VERA_CONTRACT`, `VERA_DIGIT_BARRIER` and `VERA_DIGIT_TICKS`. Values in `.env` win over the file, and keeping your changes there means `git pull` never conflicts with them. `0` turns `DAILY_STOP_LOSS` and `BANKROLL` off.
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -121,6 +121,8 @@ Instead of the MA/RSI signals, two machine-learning models (gradient boosting, s
 ```bash
 python3 vera_bot.py --train      # train + test now and print the report
 ```
+
+To dedicate the AI to specific contracts, e.g. only Even/Odd, set `VERA_AI_CONTRACTS=DIGITEVEN,DIGITODD`. The report then also shows the Even/Odd accuracy on unseen ticks (chance = 50%).
 
 On Deriv's random-number markets (Volatility, Jump, Step indices…) the honest result is **"NO PROVEN EDGE - stands aside"**: there is nothing to predict, and the AI protects your money by not trading. `VERA_AI_FORCE=true` makes it trade anyway (for demo testing only).
 

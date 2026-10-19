@@ -115,6 +115,9 @@ STRATEGY = setting("STRATEGY", "MA")   # "MA": MA/RSI signals (CONTRACT decides 
 AI_MIN_EDGE = setting("AI_MIN_EDGE", 0.02)       # trade only above +2% predicted expected return
 AI_TRAIN_TICKS = setting("AI_TRAIN_TICKS", 40000)  # history the models learn from
 AI_RETRAIN_HOURS = setting("AI_RETRAIN_HOURS", 6)  # retrain on fresh ticks this often
+AI_CONTRACTS = setting("AI_CONTRACTS", "")      # limit the AI, e.g. "DIGITEVEN,DIGITODD"
+                             # (empty = it may choose any contract)
+AI_ALLOWED = tuple(sorted(x.strip().upper() for x in str(AI_CONTRACTS).split(",") if x.strip()))
 AI_FORCE = setting("AI_FORCE", False)  # True = trade even without a proven edge (demo testing)
 
 MAX_OPEN_TRADES = setting("MAX_OPEN_TRADES", 3)  # trades allowed open at the same time
@@ -764,7 +767,7 @@ class TradingBot:
         from vera_ai import candidates
         stake = round(self.stake, 2)
         payouts = {}
-        for contract, barrier in candidates():
+        for contract, barrier in candidates(AI_ALLOWED):
             ct_ok = contract in ("CALL", "PUT") or not self.available_types or contract in self.available_types
             if not ct_ok:
                 continue
@@ -788,6 +791,7 @@ class TradingBot:
             self.ai = VeraAI.load(self.symbol)
         ai = self.ai
         stale = (ai is None or ai.stake != round(self.stake, 2) or ai.horizon != DIGIT_TICKS
+                 or getattr(ai, "allowed", ()) != AI_ALLOWED
                  or time.time() - ai.trained_at > AI_RETRAIN_HOURS * 3600)
         if stale:
             await self.train_ai()
@@ -807,7 +811,7 @@ class TradingBot:
             prices, _ = await download_ticks(self.api, self.symbol, AI_TRAIN_TICKS)
             payouts = await self.load_ai_payouts()
             decimals = self.decimals if self.decimals is not None else infer_decimals(prices)
-            ai = VeraAI(self.symbol, decimals, DIGIT_TICKS, round(self.stake, 2), payouts)
+            ai = VeraAI(self.symbol, decimals, DIGIT_TICKS, round(self.stake, 2), payouts, AI_ALLOWED)
             await asyncio.to_thread(ai.fit, [float(x) for x in prices], AI_MIN_EDGE)
             ai.save()
             self.ai = ai
