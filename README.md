@@ -128,6 +128,21 @@ On Deriv's random-number markets (Volatility, Jump, Step indices…) the honest 
 
 The AI uses classic machine learning, not a chat model: language models can't predict random ticks either, and each question would cost time and money.
 
+## Assembly maths (optional)
+
+The strategy maths (MA7/MA14 and RSI on every candle, plus a digit counter) is also written in
+x86-64 assembly in `vera_asm.S`. Build it once on your laptop:
+
+```bash
+sudo apt install build-essential      # only if gcc is missing
+./build_asm.sh                        # builds libvera_asm.so and checks it against pandas
+systemctl --user restart vera-bot
+```
+
+At startup the log shows `Maths engine: x86-64 assembly (libvera_asm.so)`. If the library isn't
+built, Vera uses the Python maths and gives exactly the same signals. Networking, Deriv API and AI
+stay in Python. Assembly makes the maths faster, but it does **not** make predictions more accurate.
+
 ## Backtest: test before you trade
 
 ```bash

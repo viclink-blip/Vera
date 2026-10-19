@@ -5,3 +5,4 @@ __pycache__/
 venv/
 deriv_trades.csv
 ai_models/
+libvera_asm.so

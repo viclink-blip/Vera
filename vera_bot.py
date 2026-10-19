@@ -40,6 +40,8 @@ import websockets
 import websockets.exceptions
 from dotenv import load_dotenv
 
+import vera_asm                       # x86-64 assembly maths (./build_asm.sh); pandas if not built
+
 load_dotenv(Path(__file__).with_name(".env"))
 
 
@@ -338,6 +340,22 @@ def compute_indicators(closes):
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
     rsi = (100 - 100 / (1 + gain / loss)).fillna(100.0)   # no losses -> RSI 100
     return fast, slow, rsi
+
+
+def latest_indicators(closes):
+    """(f_prev, s_prev, f_now, s_now, rsi) for the newest candles - in assembly when built."""
+    if vera_asm.available():
+        c = closes.to_numpy(dtype=float)
+        return (vera_asm.sma(c[:-1], MA_FAST), vera_asm.sma(c[:-1], MA_SLOW),
+                vera_asm.sma(c, MA_FAST), vera_asm.sma(c, MA_SLOW), vera_asm.rsi(c, RSI_PERIOD))
+    fast, slow, rsi = compute_indicators(closes)
+    return fast.iloc[-2], slow.iloc[-2], fast.iloc[-1], slow.iloc[-1], rsi.iloc[-1]
+
+
+def maths_engine():
+    if vera_asm.available():
+        return f"x86-64 assembly ({vera_asm.LIB_PATH.name})"
+    return "Python/pandas (run ./build_asm.sh for assembly)"
 
 
 def decide(f_prev, s_prev, f_now, s_now, minutes_since_trade):
@@ -731,9 +749,7 @@ class TradingBot:
         if len(self.closes) < need:
             log(f"Collecting candles {len(self.closes)}/{need}")
             return
-        fast, slow, rsi_s = compute_indicators(self.closes)
-        f_prev, s_prev, f_now, s_now = fast.iloc[-2], slow.iloc[-2], fast.iloc[-1], slow.iloc[-1]
-        rsi = rsi_s.iloc[-1]
+        f_prev, s_prev, f_now, s_now, rsi = latest_indicators(self.closes)
         log(f"{self.symbol} candle close {close} | MA{MA_FAST}={f_now:.5f} MA{MA_SLOW}={s_now:.5f} "
             f"RSI{RSI_PERIOD}={rsi:.1f}")
         if STRATEGY == "AI":
@@ -1680,6 +1696,7 @@ async def main():
         return
     if args and not args[0].startswith("-"):
         SYMBOLS = [x.strip() for x in args[0].split(",") if x.strip()]
+    log(f"Maths engine: {maths_engine()}")
     token = os.getenv("DERIV_TOKEN", "").strip()
     bots, shared = [], None
     for symbol in SYMBOLS:
